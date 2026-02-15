@@ -9,13 +9,11 @@
   };
 
   outputs =
-    { fp, ... }@inputs:
+    { fp, nixpkgs, ... }@inputs:
     fp.lib.mkFlake { inherit inputs; } {
       imports = [ ./pkgs ];
 
-      systems = [
-        "x86_64-linux"
-      ];
+      systems = nixpkgs.lib.systems.flakeExposed;
       perSystem =
         { pkgs, ... }:
         {

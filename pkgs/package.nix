@@ -7,7 +7,7 @@
 let
   fs = lib.fileset;
 
-  testOpt = callPackage ../test/opt.nix {};
+  testOpt = callPackage ../test/opt.nix { };
 in
 buildNimPackage (finalAttrs: rec {
   pname = "spam";
@@ -59,6 +59,6 @@ buildNimPackage (finalAttrs: rec {
     homepage = "https://github.com/feel-co/spam";
     license = lib.licenses.cc-by-nc-sa-40;
     mainProgram = "spam";
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 })
