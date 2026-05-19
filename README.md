@@ -1,0 +1,100 @@
+# spam
+
+**S**earch **P**ackages **A**nd **M**odule options in the wider Nix ecosystem.
+
+spam indexes Nix package closures and `nixosOptionsDoc` output into a indexed
+database with ZSTD compression. Given a substring, it finds which packages own
+matching files, or which module options match a name.
+
+## Usage
+
+```bash
+# Search module options from a JSON file
+$ spam opt --module-options options.json <query>
+
+# Search module options from a pre-built database
+$ spam opt --db options.db <query>
+
+# Search for a file across the default package database
+$ spam pkg <query>
+
+# Build a files database from a package manifest
+$ spam db build --manifest packages.json --output files.db
+
+# Build an options database from options.json
+$ spam db build --manifest options.json --output options.db
+```
+
+### `opt` - option search
+
+Search a `nixosOptionsDoc` JSON file or a pre-built options database.
+
+```bash
+# Search options.json for services.nginx
+$ spam opt --module-options options.json services.nginx
+
+# Search options database for networking.firewall
+$ spam opt --db options.db networking.firewall
+```
+
+### `pkg` - package file search
+
+Search a package-file database for which package(s) ship a given file.
+
+```bash
+# Find which package ships libfoo.so
+$ spam pkg libfoo.so
+
+# Emit JSON output for a /bin/foo search
+$ spam pkg --json /bin/foo
+```
+
+### `db build` - index a manifest
+
+Build a database from a JSON manifest. The manifest kind is auto-detected:
+option-shaped objects produce an options database; package outputs produce a
+files database.
+
+```bash
+# Build a package-file database from a manifest
+$ spam db build --manifest packages.json --output files.db
+
+# Build an options database from options.json
+$ spam db build --manifest options.json --output options.db
+```
+
+Manifest formats accepted:
+
+- Array of objects with attr, pname, version, and outputs
+- Object mapping attr to a store path string
+- Object mapping attr to an object with named output paths
+
+## Database format
+
+SPAM databases are zstd-compressed text files with a 256-bucket binary index.
+Each line is keyed by every unique byte in its search key, providing sublinear
+lookup for any query. The magic header `# spam-db-v1` identifies the file kind
+(options or packages).
+
+## Building
+
+Requires Nim >= 2.2.0 and libzstd.
+
+```bash
+# Compile the project
+$ nimble build
+```
+
+Release build:
+
+```bash
+# Release build with optimizations
+$ nimble release
+```
+
+Nix:
+
+```bash
+# Build via Nix flake
+$ nix build
+```
