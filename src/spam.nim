@@ -1,8 +1,16 @@
-import std/[algorithm, json, os, parseopt, sequtils, sets, strformat, strutils, tables]
+import std/[algorithm, json, os, parseopt, sequtils, sets, strformat, strutils,
+    tables]
+
+{.passL: "-lzstd".}
 
 const
   DbMagic = "# spam-db-v1"
   DefaultDbName = "spam/files.db"
+  IndexBuckets = 256
+  IndexEntrySize = 8
+  IndexSize = IndexBuckets * IndexEntrySize
+  ZstdContentSizeError = uint64.high
+  ZstdContentSizeUnknown = uint64.high - 1
 
 type
   Command = enum
@@ -39,6 +47,25 @@ type
   FileRecord = object
     path: string
     packages: seq[string]
+
+proc zstdCompressBound(srcSize: csize_t): csize_t {.importc: "ZSTD_compressBound".}
+proc zstdCompress(
+  dst: pointer,
+  dstCapacity: csize_t,
+  src: pointer,
+  srcSize: csize_t,
+  compressionLevel: cint,
+): csize_t {.importc: "ZSTD_compress".}
+proc zstdGetFrameContentSize(src: pointer, srcSize: csize_t): uint64 {.
+    importc: "ZSTD_getFrameContentSize".}
+proc zstdDecompress(
+  dst: pointer,
+  dstCapacity: csize_t,
+  src: pointer,
+  compressedSize: csize_t,
+): csize_t {.importc: "ZSTD_decompress".}
+proc zstdIsError(code: csize_t): cuint {.importc: "ZSTD_isError".}
+proc zstdGetErrorName(code: csize_t): cstring {.importc: "ZSTD_getErrorName".}
 
 proc fail(message: string) {.noreturn.} =
   stderr.writeLine("spam: " & message)
@@ -203,21 +230,121 @@ proc ensureParent(path: string) =
   if dir.len > 0:
     createDir(dir)
 
-proc openDatabase(path: string, kind: DbKind): File =
-  path.ensureParent()
-  result = open(path, fmWrite)
-  result.writeLine(header(kind))
+proc putUint32(value: uint32): string =
+  for shift in countup(0, 24, 8):
+    result.add(char((value shr shift) and 0xff'u32))
 
-proc checkedLines(path: string, kind: DbKind): seq[string] =
-  var seenHeader = false
-  for line in lines(path):
-    if not seenHeader:
-      seenHeader = true
-      if line != header(kind):
-        fail("unsupported database format: " & path)
-      continue
+proc getUint32(data: string, offset: int): uint32 =
+  if offset + 4 > data.len:
+    fail("truncated database index")
+
+  for shift in countup(0, 24, 8):
+    result = result or (uint32(data[offset + shift div 8]) shl shift)
+
+proc zstdCompress(input: string): string =
+  if input.len == 0:
+    return ""
+
+  result = newString(int(zstdCompressBound(csize_t(input.len))))
+  let compressedSize = zstdCompress(addr result[0], csize_t(result.len),
+    unsafeAddr input[0], csize_t(input.len), 3)
+  if zstdIsError(compressedSize) != 0:
+    fail("zstd compression failed: " & $zstdGetErrorName(compressedSize))
+  result.setLen(int(compressedSize))
+
+proc zstdDecompress(input: string): string =
+  if input.len == 0:
+    return ""
+
+  let contentSize = zstdGetFrameContentSize(unsafeAddr input[0], csize_t(input.len))
+  if contentSize == ZstdContentSizeError:
+    fail("invalid zstd frame in database")
+  if contentSize == ZstdContentSizeUnknown:
+    fail("zstd frame has unknown decompressed size")
+  if contentSize > uint64(int.high):
+    fail("zstd frame is too large")
+
+  result = newString(int(contentSize))
+  if result.len == 0:
+    return
+
+  let decompressedSize = zstdDecompress(addr result[0], csize_t(result.len),
+    unsafeAddr input[0], csize_t(input.len))
+  if zstdIsError(decompressedSize) != 0:
+    fail("zstd decompression failed: " & $zstdGetErrorName(decompressedSize))
+  result.setLen(int(decompressedSize))
+
+proc searchableKey(line: string): string =
+  let tab = line.find('\t')
+  if tab < 0: line else: line[0 ..< tab]
+
+proc readExact(file: File, path: string, length: int): string =
+  if length == 0:
+    return ""
+
+  result = newString(length)
+  let read = file.readBuffer(addr result[0], length)
+  if read != length:
+    fail("truncated database: " & path)
+
+proc indexedBucketLines(path: string, kind: DbKind, bucket: int): seq[string] =
+  var file = open(path, fmRead)
+  defer: file.close()
+
+  let headerLine = file.readLine()
+  if headerLine != header(kind):
+    fail("unsupported database format: " & path)
+
+  let
+    indexStart = headerLine.len + 1
+    dataStart = indexStart + IndexSize
+    index = file.readExact(path, IndexSize)
+
+  let entry = bucket * IndexEntrySize
+  let
+    offset = int(getUint32(index, entry))
+    length = int(getUint32(index, entry + 4))
+  if length == 0:
+    return
+
+  file.setFilePos(dataStart + offset)
+  let body = zstdDecompress(file.readExact(path, length))
+  for line in body.splitLines():
     if line.len > 0:
       result.add(line)
+
+proc queryBucket(query: string): int =
+  if query.len == 0: 0 else: ord(query[0])
+
+proc writeIndexedDatabase(path: string, kind: DbKind, lines: seq[string]) =
+  path.ensureParent()
+
+  var buckets: array[IndexBuckets, seq[string]]
+  for line in lines:
+    var seenBytes: set[char]
+    let key = line.searchableKey()
+    for byte in key:
+      if byte notin seenBytes:
+        seenBytes.incl(byte)
+        buckets[ord(byte)].add(line)
+
+  var
+    index = newStringOfCap(IndexSize)
+    payload = ""
+    offset = 0'u32
+
+  for bucket in buckets:
+    let compressed =
+      if bucket.len == 0: ""
+      else: zstdCompress(bucket.join("\n") & "\n")
+    if offset.uint64 + compressed.len.uint64 > uint32.high.uint64:
+      fail("database is too large for the index")
+    index.add(putUint32(offset))
+    index.add(putUint32(uint32(compressed.len)))
+    payload.add(compressed)
+    offset += uint32(compressed.len)
+
+  writeFile(path, header(kind) & "\n" & index & payload)
 
 proc compact(value: string): string =
   value.splitWhitespace().join(" ")
@@ -259,14 +386,13 @@ proc optionRecords(options: JsonNode): seq[OptionRecord] =
   result.sort(proc(a, b: OptionRecord): int = cmp(a.name, b.name))
 
 proc writeOptionsDatabase(path: string, records: seq[OptionRecord]) =
-  var file = openDatabase(path, dbOptions)
-  defer: file.close()
-
+  var lines: seq[string]
   for record in records:
-    file.writeLine(record.name & "\t" & record.summary)
+    lines.add(record.name & "\t" & record.summary)
+  writeIndexedDatabase(path, dbOptions, lines)
 
-proc loadOptionsDatabase(path: string): seq[OptionRecord] =
-  for line in checkedLines(path, dbOptions):
+proc parseOptions(lines: seq[string]): seq[OptionRecord] =
+  for line in lines:
     let tab = line.find('\t')
     if tab < 0:
       result.add(OptionRecord(name: line))
@@ -277,6 +403,10 @@ proc matchingOptions(records: seq[OptionRecord], query: string): seq[OptionRecor
   for record in records:
     if query in record.name:
       result.add(record)
+
+proc loadMatchingOptionsDatabase(path, query: string): seq[OptionRecord] =
+  matchingOptions(parseOptions(indexedBucketLines(path, dbOptions,
+      query.queryBucket)), query)
 
 proc printOptions(records: seq[OptionRecord], jsonOutput: bool) =
   if jsonOutput:
@@ -296,8 +426,7 @@ proc searchOptionsJson(config: Config) =
   printOptions(matchingOptions(records, config.query), config.jsonOutput)
 
 proc searchOptionsDb(config: Config) =
-  printOptions(matchingOptions(loadOptionsDatabase(config.database),
-      config.query),
+  printOptions(loadMatchingOptionsDatabase(config.database, config.query),
     config.jsonOutput)
 
 proc packageName(attr, pname, version, output: string): string =
@@ -383,19 +512,18 @@ proc packageFileRecords(outputs: seq[PackageOutput]): Table[string, HashSet[stri
         result.mgetOrPut(rel, initHashSet[string]()).incl(output.name)
 
 proc writePackagesDatabase(path: string, records: Table[string, HashSet[string]]) =
-  var file = openDatabase(path, dbPackages)
-  defer: file.close()
-
   var paths = toSeq(records.keys)
   paths.sort()
 
+  var lines: seq[string]
   for path in paths:
     var packages = toSeq(records[path])
     packages.sort()
-    file.writeLine(path & "\t" & packages.join(","))
+    lines.add(path & "\t" & packages.join(","))
+  writeIndexedDatabase(path, dbPackages, lines)
 
-proc loadPackagesDatabase(path: string): seq[FileRecord] =
-  for line in checkedLines(path, dbPackages):
+proc parsePackages(lines: seq[string]): seq[FileRecord] =
+  for line in lines:
     let tab = line.find('\t')
     if tab < 0:
       continue
@@ -408,6 +536,10 @@ proc matchingPackages(records: seq[FileRecord], query: string): seq[FileRecord] 
   for record in records:
     if query in record.path:
       result.add(record)
+
+proc loadMatchingPackagesDatabase(path, query: string): seq[FileRecord] =
+  matchingPackages(parsePackages(indexedBucketLines(path, dbPackages,
+      query.queryBucket)), query)
 
 proc printPackages(records: seq[FileRecord], jsonOutput: bool) =
   if jsonOutput:
@@ -472,8 +604,8 @@ proc main() =
     of optSourceNone:
       discard
   of cmdPkg:
-    let matches = matchingPackages(loadPackagesDatabase(config.database), config.query)
-    printPackages(matches, config.jsonOutput)
+    printPackages(loadMatchingPackagesDatabase(config.database, config.query),
+      config.jsonOutput)
   of cmdDb:
     buildDatabase(config)
   of cmdNone:
