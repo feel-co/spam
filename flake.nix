@@ -24,7 +24,7 @@
               pkgs.coreutils-full
               pkgs.fd
               pkgs.nim
-              pkgs.nixfmt-rfc-style
+              pkgs.nixfmt
             ];
 
             text = ''
