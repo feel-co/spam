@@ -73,13 +73,15 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
   if opts.verbose:
     stderr.writeLine("spam: running nix-env " & args.join(" "))
 
-  let nix = startProcess("nix-env", args = args, options = {poUsePath,
-      poStderrToStdout})
+  let nix = startProcess("nix-env", args = args, options = {poUsePath})
   let output = nix.outputStream.readAll()
+  let errOutput = nix.errorStream.readAll()
   let exitCode = nix.waitForExit()
   nix.close()
   if exitCode != 0:
-    raise newException(OSError, "nix-env failed:\n" & output)
+    raise newException(OSError, "nix-env failed:\n" & errOutput & output)
+  if errOutput.len > 0 and opts.verbose:
+    stderr.write("spam: nix-env stderr: " & errOutput)
 
   # Parse the XML stream
   var xml = newStringStream(output)
