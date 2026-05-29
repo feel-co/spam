@@ -29,12 +29,16 @@
               pkgs.fd
               pkgs.nim
               pkgs.nixfmt
+
+              # Rust
               (pkgs.rustfmt.override { asNightly = true; })
+              pkgs.taplo
             ];
 
             text = ''
               fd "$@" -t f -e nix -x nixfmt '{}'
               fd "$@" -t f -e nim -x nimpretty '{}'
+              fd "$@" -t f -e toml -x taplo fmt '{}'
               fd "$@" -t f -e rust -x rustfmt --edition 2024 --config-path ./spam-db/.rustfmt.toml '{}'
             '';
           };
