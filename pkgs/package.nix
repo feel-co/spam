@@ -2,6 +2,7 @@
   lib,
   buildNimPackage,
   pandoc,
+  zstd,
   callPackage,
 }:
 let
@@ -39,6 +40,10 @@ buildNimPackage (finalAttrs: rec {
 
   nativeBuildInputs = [
     pandoc
+  ];
+
+  buildInputs = [
+    zstd
   ];
 
   postBuild = ''
