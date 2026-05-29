@@ -13,12 +13,21 @@ import std/[asyncdispatch, httpclient, json, strutils, math, random]
 
 const
   DefaultCacheUrl* = "https://cache.nixos.org"
-  MaxRetries = 5
-  BaseDelayMs = 200
+  MaxRetries = 7
+  BaseDelayMs = 300
   ## Maximum number of concurrent HTTP requests.
-  MaxConcurrent* = 512
+  ## XXX: 512 concurrent connections overwhelms cache.nixos.org and triggers
+  ## server-side disconnects as well as assertion failures in Nim's httpclient.
+  ## :(
+  MaxConcurrent* = 32
+  ## Per-request timeout in milliseconds.
+  RequestTimeoutMs = 30_000
 
 type
+  PermanentHttpError* = object of HttpRequestError
+    ## Raised for non-retriable HTTP errors (4xx except 404).
+    ## Must not be retried; propagates immediately out of fetchWithRetry.
+
   NarInfo* = object
     ## Parsed subset of a .narinfo file.
     hash*: string
@@ -43,42 +52,48 @@ type
 
   CacheClient* = ref object
     cacheUrl*: string
-    client: AsyncHttpClient
 
 proc newCacheClient*(cacheUrl: string = DefaultCacheUrl): CacheClient =
   ## Create a new cache client for the given binary cache URL.
   result = CacheClient(
     cacheUrl: cacheUrl.strip(chars = {'/'}),
-    client: newAsyncHttpClient(),
   )
-  result.client.headers = newHttpHeaders({"Accept-Encoding": "gzip, deflate"})
 
 proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
   ## Fetch `url`, returning body on success or "" on 404.
   ## Retries on 5xx/network errors with exponential backoff + jitter.
+  ## Non-404 4xx responses raise PermanentHttpError immediately (no retry).
+  ## Creates a fresh AsyncHttpClient per attempt to avoid concurrent reuse issues.
   var delay = BaseDelayMs
   for attempt in 0 ..< MaxRetries:
+    let client = newAsyncHttpClient()
+    client.timeout = RequestTimeoutMs
+    client.headers = newHttpHeaders({"Accept-Encoding": "gzip, deflate"})
     try:
-      let resp = await c.client.get(url)
+      let resp = await client.get(url)
       case resp.status[0]
       of '2':
-        return await resp.body
+        result = await resp.body
+        try: client.close() except CatchableError: discard
+        return
       of '4':
-        # 404 = not found, treat as empty (not an error)
+        try: client.close() except CatchableError: discard
         if resp.status.startsWith("404"):
           return ""
-        raise newException(HttpRequestError, "HTTP " & resp.status & " for " & url)
+        # 4xx (non-404) is a permanent client error; retrying will not help.
+        raise newException(PermanentHttpError, "HTTP " & resp.status & " for " & url)
       else:
-        # 5xx or other – retry
+        try: client.close() except CatchableError: discard
         if attempt == MaxRetries - 1:
           raise newException(HttpRequestError, "HTTP " & resp.status & " for " & url)
-        await sleepAsync(delay + rand(delay div 4))
-        delay = min(delay * 2, 8000)
-    except CatchableError as e:
+    except PermanentHttpError:
+      raise
+    except CatchableError:
+      try: client.close() except CatchableError: discard
       if attempt == MaxRetries - 1:
         raise
-      await sleepAsync(delay + rand(delay div 4))
-      delay = min(delay * 2, 8000)
+    await sleepAsync(delay + rand(delay div 4))
+    delay = min(delay * 2, 8000)
   return ""
 
 proc fetchNarInfo*(c: CacheClient, hash: string): Future[NarInfo] {.async.} =
@@ -172,10 +187,3 @@ proc fetchFileListing*(c: CacheClient, hash: string): Future[seq[
     walkLsNode("/", rootNode, result)
   except JsonParsingError:
     return @[]
-
-proc close*(c: CacheClient) =
-  ## Release the underlying HTTP client.
-  try:
-    c.client.close()
-  except CatchableError:
-    discard
