@@ -8,5 +8,5 @@ bin           = @["spam"]
 requires "nim >= 2.2.0"
 
 task release, "Release build":
-  exec "nimble build -d:release --opt:speed"
+  exec "nimble build -d:release -d:ssl --opt:speed"
 #  exec "pandoc -s -o FIXME.1 doc/FIXME.man1.md"

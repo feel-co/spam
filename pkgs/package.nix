@@ -1,6 +1,7 @@
 {
   lib,
   buildNimPackage,
+  openssl,
   pandoc,
   zstd,
   callPackage,
@@ -45,7 +46,10 @@ buildNimPackage (finalAttrs: rec {
     pandoc
   ];
 
+  nimFlags = [ "-d:ssl" ];
+
   buildInputs = [
+    openssl
     zstd
   ];
 
