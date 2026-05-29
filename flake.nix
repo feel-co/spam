@@ -22,7 +22,7 @@
         { pkgs, ... }:
         {
           formatter = pkgs.writeShellApplication {
-            name = "nimpretty-nixfmt-wrapper";
+            name = "nix3-nixfmt-wrapper";
 
             runtimeInputs = [
               pkgs.coreutils-full
@@ -35,7 +35,7 @@
             text = ''
               fd "$@" -t f -e nix -x nixfmt '{}'
               fd "$@" -t f -e nim -x nimpretty '{}'
-              fd "$@" -t f -e rust -x rustfmt --edition 2024 '{}'
+              fd "$@" -t f -e rust -x rustfmt --edition 2024 --config-path ./spam-db/.rustfmt.toml '{}'
             '';
           };
         };
