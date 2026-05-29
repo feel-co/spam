@@ -1,6 +1,6 @@
 [package]
 name = "spam-db"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Parser and query library for SPAM databases"
 license = "MPL-2.0"
@@ -11,3 +11,10 @@ categories = ["parser-implementations", "database"]
 
 [dependencies]
 zstd = "0.13.3"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+harness = false
+name = "query"

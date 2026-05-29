@@ -55,7 +55,7 @@ pub mod packages;
 pub use error::Error;
 pub use format::DbKind;
 pub use options::{OptionRecord, OptionsDb};
-pub use packages::{FileRecord, PackagesDb};
+pub use packages::{FileKind, FileRecord, PackagesDb};
 
 /// Convenience alias for `Result<T, spam_db::Error>`.
 pub type Result<T> = std::result::Result<T, Error>;

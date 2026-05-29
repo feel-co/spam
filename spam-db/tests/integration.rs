@@ -201,6 +201,11 @@ fn packages_query_finds_matching_record() {
   assert!(!results.is_empty(), "expected results for \"/bin/\"");
   assert_eq!(results[0].path, "/bin/hello");
   assert_eq!(results[0].packages, vec!["hello-2.12"]);
+
+  // Legacy records have zeroed metadata
+  assert_eq!(results[0].size, 0);
+  assert!(!results[0].executable);
+  assert_eq!(results[0].target, "");
 }
 
 #[test]
@@ -212,6 +217,49 @@ fn packages_query_multiple_owners() {
   let results = db.query("/bin/sh").unwrap();
   assert_eq!(results.len(), 1);
   assert_eq!(results[0].packages, vec!["bash-5.2", "busybox-1.36"]);
+}
+
+#[test]
+fn packages_query_extended_format_with_metadata() {
+  // Extended format: path\tkind\tsize\texec\ttarget\tpkg1,pkg2,...
+  let bytes = build_db(
+    "packages",
+    &[
+      "/bin/hello\tr\t29488\t1\t\thello-2.12",
+      "/lib/libfoo.so\tr\t153600\t0\t\tfoo-1.0",
+      "/etc/symlink\ts\t0\t0\t/bin/hello\thello-2.12",
+    ],
+  );
+  let f = TempFile::write("spam_test_pkg_extended.db", &bytes);
+  let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+  let results = db.query("/bin/hello").unwrap();
+  assert_eq!(results.len(), 1);
+  assert_eq!(results[0].path, "/bin/hello");
+  assert_eq!(results[0].size, 29488);
+  assert!(results[0].executable);
+  assert_eq!(results[0].packages, vec!["hello-2.12"]);
+
+  let sym = db.query("/etc/symlink").unwrap();
+  assert_eq!(sym.len(), 1);
+  assert_eq!(sym[0].target, "/bin/hello");
+  use spam_db::packages::FileKind;
+  assert_eq!(sym[0].kind, FileKind::Symlink);
+}
+
+#[test]
+fn packages_query_extended_non_executable() {
+  let bytes = build_db(
+    "packages",
+    &["/lib/libfoo.so\tr\t153600\t0\t\tfoo-1.0"],
+  );
+  let f = TempFile::write("spam_test_pkg_nonexec.db", &bytes);
+  let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+  let results = db.query("/lib/").unwrap();
+  assert_eq!(results.len(), 1);
+  assert!(!results[0].executable);
+  assert_eq!(results[0].size, 153600);
 }
 
 #[test]
