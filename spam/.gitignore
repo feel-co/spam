@@ -6,3 +6,6 @@
 !/src
 !/test
 !/spam.nimble
+
+# Ignore build artifact. Source filters are confusing.
+spam
