@@ -10,7 +10,9 @@ on:
 jobs:
   index:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         system: ['x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin']
     name: Index ${{ matrix.system }}
