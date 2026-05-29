@@ -57,11 +57,10 @@ proc hashFromPath*(storePath: string): string =
   let dash = base.find('-')
   if dash > 0: base[0 ..< dash] else: base
 
-# ── nix-env XML enumeration ────────────────────────────────────────────────
-
 proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
   ## Run nix-env -qaP --out-path --xml and parse the output into StoreOutputs.
-  ## This is synchronous; it may take 30-90 seconds on a cold nixpkgs eval.
+  ## Parses the XML stream incrementally without buffering the entire output
+  ## (100K+ packages with full store paths would otherwise OOM the process).
   var args = @[
     "-qaP", "--out-path", "--xml",
     "--arg", "config", "{ allowAliases = false; }",
@@ -77,19 +76,11 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
     stderr.writeLine("spam: running nix-env " & args.join(" "))
 
   let nix = startProcess("nix-env", args = args, options = {poUsePath})
-  let output = nix.outputStream.readAll()
-  let errOutput = nix.errorStream.readAll()
-  let exitCode = nix.waitForExit()
-  nix.close()
-  if exitCode != 0:
-    raise newException(OSError, "nix-env failed:\n" & errOutput & output)
-  if errOutput.len > 0 and opts.verbose:
-    stderr.write("spam: nix-env stderr: " & errOutput)
 
-  # Parse the XML stream
-  var xml = newStringStream(output)
+  # Parse stdout incrementally — the XML for 126K packages is easily
+  # 100+ MiB; buffering it all with readAll() causes OOM.
   var parser: XmlParser
-  open(parser, xml, "nix-env output")
+  open(parser, nix.outputStream, "nix-env output")
   defer: parser.close()
 
   var
@@ -110,7 +101,6 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
         if inItem:
           var outputName = ""
           var outputPath = ""
-          # Collect attributes from the <output> element
           while true:
             parser.next()
             if parser.kind == xmlAttribute:
@@ -125,7 +115,6 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
             let nameVer =
               if dashPos > 0: outputPath.lastPathPart()[dashPos + 1 .. ^1]
               else: currentAttr
-            # Split pname-version heuristically at last hyphen before a digit
             var pname = nameVer
             var version = ""
             for i in countdown(nameVer.len - 1, 1):
@@ -156,7 +145,15 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
     else:
       discard
 
-# ── Reference traversal workset ───────────────────────────────────────────
+  # stderr from nix-env is small (a few eval warnings); read after stdout
+  # EOF to avoid pipe deadlock.
+  let errOutput = nix.errorStream.readAll()
+  let exitCode = nix.waitForExit()
+  nix.close()
+  if exitCode != 0:
+    raise newException(OSError, "nix-env failed:\n" & errOutput)
+  if errOutput.len > 0 and opts.verbose:
+    stderr.write("spam: nix-env stderr: " & errOutput)
 
 proc indexWithCache*(
   outputs: seq[StoreOutput],
@@ -171,10 +168,11 @@ proc indexWithCache*(
   ##
   ## Returns a deduplicated seq of FileEntry with full metadata.
   let client = newCacheClient(opts.cacheUrl)
-  defer: client.close()
 
   # visited: hashes we've already fetched or enqueued
   var visited = initHashSet[string]()
+  # retried: hashes that have already been re-queued once after a failure
+  var retried = initHashSet[string]()
   # hashToAttr: maps hash -> attr name for top-level packages
   var hashToAttr = initTable[string, string]()
 
@@ -239,10 +237,17 @@ proc indexWithCache*(
           metaTable[entry.path] = entry
           fileTable.mgetOrPut(entry.path, initHashSet[string]()).incl(attr)
 
-      except CatchableError as e:
-        # Individual hash failures are non-fatal; log and continue
+      except Exception as e:
+        # Catch both CatchableError and Defect (e.g. AssertionDefect from
+        # httpclient when a connection is torn down under high concurrency).
+        # Individual hash failures are non-fatal; log and re-queue for one
+        # more attempt.
         if opts.verbose:
           stderr.writeLine("spam: warning: failed to index " & hash & ": " & e.msg)
+        # Re-queue if not yet retried to recover transient failures.
+        if hash notin retried:
+          retried.incl(hash)
+          queue.add(hash)
 
   if opts.verbose:
     stderr.writeLine("spam: traversal complete. visited=" & $visited.len &
@@ -267,6 +272,7 @@ proc indexWithCache*(
       target: meta.target,
       packages: pkgs,
     ))
+
 
 proc buildIndexDatabase*(opts: IndexOptions): Future[seq[FileEntry]] {.async.} =
   ## Top-level entry: enumerate packages via nix-env, then index via binary cache.
