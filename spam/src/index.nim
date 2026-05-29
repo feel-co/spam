@@ -39,6 +39,8 @@ type
       ## Optional -A scope filter.
     maxConcurrent*: int
       ## Max parallel HTTP requests. Defaults to MaxConcurrent from cache.nim.
+    followRefs*: bool
+      ## If true, follow transitive store references (BFS). Much slower.
     verbose*: bool
 
 proc defaultIndexOptions*(): IndexOptions =
@@ -46,6 +48,7 @@ proc defaultIndexOptions*(): IndexOptions =
     cacheUrl: DefaultCacheUrl,
     nixpkgs: "<nixpkgs>",
     maxConcurrent: MaxConcurrent,
+    followRefs: false,
   )
 
 proc hashFromPath*(storePath: string): string =
@@ -205,34 +208,41 @@ proc indexWithCache*(
 
     # Await all futures
     for i, hash in batch:
-      let narInfo = await narFutures[i]
-      let entries = await lsFutures[i]
+      try:
+        let narInfo = await narFutures[i]
+        let entries = await lsFutures[i]
 
-      inc processed
-      if opts.verbose and processed mod 100 == 0:
-        stderr.writeLine("spam: indexed " & $processed & " paths, queue=" & $queue.len)
+        inc processed
+        if opts.verbose and processed mod 100 == 0:
+          stderr.writeLine("spam: indexed " & $processed & " paths, queue=" & $queue.len)
 
-      # Enqueue newly discovered references
-      for refHash in narInfo.references:
-        if refHash notin visited:
-          visited.incl(refHash)
-          queue.add(refHash)
+        # Enqueue newly discovered references (only if followRefs is enabled)
+        if opts.followRefs:
+          for refHash in narInfo.references:
+            if refHash notin visited:
+              visited.incl(refHash)
+              queue.add(refHash)
 
-      # The attr name for this path: use hashToAttr if top-level, else use storePath basename
-      let attr =
-        if hash in hashToAttr: hashToAttr[hash]
-        else:
-          let name = narInfo.storePath.lastPathPart()
-          let dash = name.find('-')
-          if dash > 0: name[dash + 1 .. ^1] else: name
+        # The attr name for this path: use hashToAttr if top-level, else use storePath basename
+        let attr =
+          if hash in hashToAttr: hashToAttr[hash]
+          else:
+            let name = narInfo.storePath.lastPathPart()
+            let dash = name.find('-')
+            if dash > 0: name[dash + 1 .. ^1] else: name
 
-      # Merge file entries into the deduplication tables
-      for entry in entries:
-        # Skip directory entries from the merge (they clutter queries)
-        if entry.kind == "directory":
-          continue
-        metaTable[entry.path] = entry
-        fileTable.mgetOrPut(entry.path, initHashSet[string]()).incl(attr)
+        # Merge file entries into the deduplication tables
+        for entry in entries:
+          # Skip directory entries from the merge (they clutter queries)
+          if entry.kind == "directory":
+            continue
+          metaTable[entry.path] = entry
+          fileTable.mgetOrPut(entry.path, initHashSet[string]()).incl(attr)
+
+      except CatchableError as e:
+        # Individual hash failures are non-fatal; log and continue
+        if opts.verbose:
+          stderr.writeLine("spam: warning: failed to index " & hash & ": " & e.msg)
 
   if opts.verbose:
     stderr.writeLine("spam: traversal complete. visited=" & $visited.len &

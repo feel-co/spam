@@ -16,7 +16,7 @@ const
   MaxRetries = 5
   BaseDelayMs = 200
   ## Maximum number of concurrent HTTP requests.
-  MaxConcurrent* = 32
+  MaxConcurrent* = 512
 
 type
   NarInfo* = object
@@ -175,4 +175,7 @@ proc fetchFileListing*(c: CacheClient, hash: string): Future[seq[
 
 proc close*(c: CacheClient) =
   ## Release the underlying HTTP client.
-  c.client.close()
+  try:
+    c.client.close()
+  except CatchableError:
+    discard

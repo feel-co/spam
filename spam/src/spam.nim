@@ -44,6 +44,7 @@ type
     indexScope: string
     indexCacheUrl: string
     indexConcurrent: int
+    indexFollowRefs: bool
     verbose: bool
 
   OptionRecord = object
@@ -124,7 +125,9 @@ index options:
       --cache-url <url>    Binary cache URL. Defaults to https://cache.nixos.org.
       --system <system>    Override the target system (e.g. x86_64-linux).
       --scope <attr>       Limit indexing to a single attr set (e.g. python3Packages).
-      --concurrent <n>     Maximum parallel HTTP requests (default: 32).
+      --concurrent <n>     Maximum parallel HTTP requests (default: 512).
+      --no-follow-refs     Only index direct package outputs, skip transitive
+                           reference traversal (much faster). Enabled by default.
       --verbose            Print progress to stderr.
 
 Manifest formats for 'db build':
@@ -178,7 +181,7 @@ proc parseArgs(): Config =
 
   var parser = initOptParser(
     shortNoVal = {'h'},
-    longNoVal = @["help", "json", "verbose"],
+    longNoVal = @["help", "json", "verbose", "no-follow-refs"],
   )
   var args: seq[string]
 
@@ -221,6 +224,8 @@ proc parseArgs(): Config =
         if n < 1 or n > 256:
           fail("--concurrent must be between 1 and 256")
         result.indexConcurrent = n
+      of "no-follow-refs":
+        result.indexFollowRefs = false
       else:
         fail("unknown option: --" & key)
     of cmdEnd:
@@ -680,6 +685,7 @@ proc runIndex(config: Config) =
   opts.system = config.indexSystem
   opts.scope = config.indexScope
   opts.maxConcurrent = config.indexConcurrent
+  opts.followRefs = config.indexFollowRefs
   opts.verbose = config.verbose
 
   if opts.verbose:
