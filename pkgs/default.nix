@@ -25,6 +25,9 @@
         MYNAME = self'.packages.default;
       };
 
-      packages.default = final.callPackage ./package.nix { };
+      packages = {
+        spam = final.callPackage ./package.nix { };
+        default = self'.packages.spam;
+      };
     };
 }
