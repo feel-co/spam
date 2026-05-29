@@ -2,26 +2,60 @@
 ##
 ## Fetches .narinfo and .ls/.ls.xz file listings from a Nix binary cache
 ## (e.g. https://cache.nixos.org) for autonomous database indexing.
-##
-## Design:
-##   - Uses std/asynchttpclient + std/asyncdispatch for concurrent fetches.
-##   - Limits concurrency via a semaphore (maxConcurrent requests in-flight).
-##   - Exponential backoff with jitter on transient failures (5xx / network).
-##   - Parses narinfo text format and .ls JSON listings.
-
 import std/[asyncdispatch, httpclient, json, strutils, math, random]
+
+{.passL: "-lbrotlidec".}
+
+type BrotliDecoderResult = cint
+
+const
+  BrotliResultSuccess = BrotliDecoderResult(1)
+  BrotliResultNeedsOutput = BrotliDecoderResult(3)
+
+proc brotliDecoderDecompress(
+  encodedSize: csize_t,
+  encodedBuffer: pointer,
+  decodedSize: ptr csize_t,
+  decodedBuffer: pointer,
+): BrotliDecoderResult {.importc: "BrotliDecoderDecompress".}
+
+proc brotliDecompress(data: string): string =
+  ## Decompress a Brotli-encoded string. Raises IOError on failure.
+  if data.len == 0:
+    return ""
+
+  # Brotli has no frame header with decompressed size; start at 8x and double.
+  var capacity = csize_t(max(data.len * 8, 4096))
+  while true:
+    result = newString(int(capacity))
+    var outLen = capacity
+    let rc = brotliDecoderDecompress(
+      csize_t(data.len), unsafeAddr data[0],
+      addr outLen, addr result[0],
+    )
+    if rc == BrotliResultSuccess:
+      result.setLen(int(outLen))
+      return
+    elif rc == BrotliResultNeedsOutput:
+      if capacity >= csize_t(64 * 1024 * 1024):
+        raise newException(IOError, "brotli output exceeds 64 MiB")
+      capacity = capacity * 2
+    else:
+      raise newException(IOError, "brotli decompression failed (result=" & $rc & ")")
 
 const
   DefaultCacheUrl* = "https://cache.nixos.org"
-  MaxRetries = 7
-  BaseDelayMs = 300
+  MaxRetries = 20
+  BaseDelayMs = 50
   ## Maximum number of concurrent HTTP requests.
-  ## XXX: 512 concurrent connections overwhelms cache.nixos.org and triggers
+  ## 512 concurrent connections overwhelms cache.nixos.org and triggers
   ## server-side disconnects as well as assertion failures in Nim's httpclient.
-  ## :(
   MaxConcurrent* = 32
   ## Per-request timeout in milliseconds.
   RequestTimeoutMs = 30_000
+  ## cache.nixos.org caches 5xx errors for ~5 seconds, so retries must
+  ## wait at least this long to avoid hitting the same cached error.
+  ServerErrorFloorMs = 5000
 
 type
   PermanentHttpError* = object of HttpRequestError
@@ -62,38 +96,59 @@ proc newCacheClient*(cacheUrl: string = DefaultCacheUrl): CacheClient =
 proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
   ## Fetch `url`, returning body on success or "" on 404.
   ## Retries on 5xx/network errors with exponential backoff + jitter.
+  ## 5xx retries use a 5 s floor (cache.nixos.org caches server errors for ~5 s).
   ## Non-404 4xx responses raise PermanentHttpError immediately (no retry).
   ## Creates a fresh AsyncHttpClient per attempt to avoid concurrent reuse issues.
   var delay = BaseDelayMs
+  var statusStr = ""
   for attempt in 0 ..< MaxRetries:
     let client = newAsyncHttpClient()
     client.timeout = RequestTimeoutMs
-    client.headers = newHttpHeaders({"Accept-Encoding": "gzip, deflate"})
+    client.headers = newHttpHeaders()
+    statusStr = ""
     try:
       let resp = await client.get(url)
-      case resp.status[0]
+      statusStr = resp.status
+      case statusStr[0]
       of '2':
-        result = await resp.body
+        let raw = await resp.body
+        let encoding = resp.headers.getOrDefault(
+            "content-encoding").toLowerAscii()
+        result =
+          if encoding == "br": brotliDecompress(raw)
+          else: raw
         try: client.close() except CatchableError: discard
         return
       of '4':
         try: client.close() except CatchableError: discard
-        if resp.status.startsWith("404"):
+        if statusStr.startsWith("404"):
           return ""
         # 4xx (non-404) is a permanent client error; retrying will not help.
-        raise newException(PermanentHttpError, "HTTP " & resp.status & " for " & url)
+        raise newException(PermanentHttpError, "HTTP " & statusStr & " for " & url)
       else:
         try: client.close() except CatchableError: discard
         if attempt == MaxRetries - 1:
-          raise newException(HttpRequestError, "HTTP " & resp.status & " for " & url)
+          raise newException(HttpRequestError, "HTTP " & statusStr & " for " & url)
     except PermanentHttpError:
       raise
     except CatchableError:
       try: client.close() except CatchableError: discard
       if attempt == MaxRetries - 1:
         raise
-    await sleepAsync(delay + rand(delay div 4))
-    delay = min(delay * 2, 8000)
+
+    if attempt == MaxRetries - 1:
+      return ""
+
+    # 5xx responses from cache.nixos.org are cached for ~5 seconds, so
+    # subsequent retries within that window will hit the same cached error.
+    let isServerError = statusStr.len > 0 and statusStr[0] notin {'2', '4'}
+    let waitMs =
+      if isServerError:
+        max(delay + rand(delay div 4), ServerErrorFloorMs)
+      else:
+        delay + rand(delay div 4)
+    await sleepAsync(waitMs)
+    delay = min(delay * 2, ServerErrorFloorMs)
   return ""
 
 proc fetchNarInfo*(c: CacheClient, hash: string): Future[NarInfo] {.async.} =

@@ -4,6 +4,7 @@
   openssl,
   pandoc,
   zstd,
+  brotli,
   callPackage,
 }:
 let
@@ -51,6 +52,7 @@ buildNimPackage (finalAttrs: rec {
   buildInputs = [
     openssl
     zstd
+    brotli
   ];
 
   postBuild = ''
