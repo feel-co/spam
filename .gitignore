@@ -1,25 +1,18 @@
 /*
 !/.gitignore
 !/README.md
-!/spam.nimble
-!/default.nix
-!/flake.nix
-!/flake.lock
 
+# Nix
 !/pkgs/
 /pkgs/*
 !/pkgs/*.nix
+!/default.nix
+!/flake.nix
+!/flake.lock
+!/test
 
-!/src/
-/src/*
-!/src/*.nim
+# Rust
+!/spam-db
 
-!/test/
-/test/*
-!/test/*.nix
-
-!/doc/
-/doc/*
-!/doc/*.md
-
-!/completions/
+# Nim
+!/spam

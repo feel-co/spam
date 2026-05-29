@@ -6,37 +6,40 @@
   callPackage,
 }:
 let
-  fs = lib.fileset;
-
   testOpt = callPackage ../test/opt.nix { };
 in
 buildNimPackage (finalAttrs: rec {
   pname = "spam";
   version = "0.0.1";
 
-  src = fs.toSource {
-    root = ./..;
-    fileset = fs.unions [
-      (fs.fileFilter (
-        file:
-        builtins.any file.hasExt [
-          "md"
-        ]
-      ) ../doc)
-      (fs.fileFilter (
-        file:
-        builtins.any file.hasExt [
-          "nim"
-        ]
-      ) ../src)
-      (fs.fileFilter (
-        file:
-        builtins.any file.hasExt [
-          "nimble"
-        ]
-      ) ./..)
-    ];
-  };
+  src =
+    let
+      fs = lib.fileset;
+      s = ../spam;
+    in
+    fs.toSource {
+      root = s;
+      fileset = fs.unions [
+        (fs.fileFilter (
+          file:
+          builtins.any file.hasExt [
+            "md"
+          ]
+        ) (s + /doc))
+        (fs.fileFilter (
+          file:
+          builtins.any file.hasExt [
+            "nim"
+          ]
+        ) (s + /src))
+        (fs.fileFilter (
+          file:
+          builtins.any file.hasExt [
+            "nimble"
+          ]
+        ) s)
+      ];
+    };
 
   nativeBuildInputs = [
     pandoc
@@ -64,6 +67,7 @@ buildNimPackage (finalAttrs: rec {
     homepage = "https://github.com/feel-co/spam";
     license = lib.licenses.cc-by-nc-sa-40;
     mainProgram = "spam";
+    maintainers = lib.teams.feel-co;
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 })

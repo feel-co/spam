@@ -1,0 +1,8 @@
+/*
+!/.gitignore
+!/README.md
+
+!/doc
+!/src
+!/test
+!/spam.nimble
