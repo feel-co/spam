@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: MIT
+# Swap setup adapted from nix-community/nix-index-database (MIT)
+name: "auto-index"
+on:
+  workflow_dispatch:
+  schedule:
+    # every sunday at 2:51
+    - cron: '51 2 * * 0'
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        system: ['x86_64-linux', 'aarch64-linux', 'x86_64-darwin', 'aarch64-darwin']
+    name: Index ${{ matrix.system }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Swap space report before modification
+      shell: bash
+      run: |
+        echo "Memory, swap and disk space:"
+        free -h
+        echo
+        swapon --show
+        echo
+        df -h /mnt .
+        echo
+    - name: Set Swap
+      shell: bash
+      run: |
+          export SWAP_FILE=$(swapon --show=NAME | tail -n 1)
+          sudo swapoff $SWAP_FILE
+          sudo rm $SWAP_FILE
+          sudo fallocate -l 10G $SWAP_FILE
+          sudo chmod 600 $SWAP_FILE
+          sudo mkswap $SWAP_FILE
+          sudo swapon $SWAP_FILE
+    - name: Swap space report after modification
+      shell: bash
+      run: |
+        echo "Memory, swap and disk space:"
+        free -h
+        echo
+        swapon --show
+        echo
+        df -h /mnt .
+        echo
+
+    - uses: cachix/install-nix-action@v31
+      with:
+        nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/nixpkgs-unstable.tar.gz
+        extra_nix_config: |
+          access-tokens = github.com=${{ github.token }}
+          system-features = nixos-test benchmark big-parallel kvm
+
+    - name: Build spam
+      run: |
+        nix build .#spam --extra-experimental-features 'nix-command flakes'
+        echo "$(pwd)/result/bin" >> "$GITHUB_PATH"
+
+    - name: Generate spam index
+      run: |
+        spam index \
+          --output ./spam-index-${{ matrix.system }} \
+          --system ${{ matrix.system }} \
+          --verbose
+
+    - name: Upload index artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: spam-index-${{ matrix.system }}
+        path: ./spam-index-${{ matrix.system }}
+        retention-days: 90
