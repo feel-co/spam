@@ -1,0 +1,11 @@
+/*
+!/.gitignore
+!/README.md
+
+!/doc
+!/src
+!/test
+!/spam.nimble
+
+# Ignore build artifact. Source filters are confusing.
+spam

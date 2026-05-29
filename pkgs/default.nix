@@ -5,9 +5,9 @@
   perSystem =
     {
       final,
-      lib,
       self',
       system,
+      lib,
       ...
     }:
     {
@@ -17,14 +17,25 @@
       };
 
       devShells.default = final.mkShell {
+        strictDeps = true;
         inputsFrom = [ self'.packages.default ];
-        packages = [ final.nimble ];
+        packages = [
+          final.nimble
+
+          # Rust
+          final.cargo
+          final.rustc
+          final.lld
+        ];
       };
 
       overlayAttrs = {
         MYNAME = self'.packages.default;
       };
 
-      packages.default = final.callPackage ./package.nix { };
+      packages = {
+        spam = final.callPackage ./package.nix { };
+        default = self'.packages.spam;
+      };
     };
 }

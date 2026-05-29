@@ -1,5 +1,8 @@
-import std/[algorithm, json, os, parseopt, sequtils, sets, strformat, strutils,
-    tables]
+import std/[algorithm, asyncdispatch, json, os, parseopt, sequtils, sets,
+    strformat, strutils, tables]
+import filemeta
+import cache
+import index
 
 {.passL: "-lzstd".}
 
@@ -14,7 +17,7 @@ const
 
 type
   Command = enum
-    cmdNone, cmdOpt, cmdPkg, cmdDb
+    cmdNone, cmdOpt, cmdPkg, cmdDb, cmdIndex
 
   DbCommand = enum
     dbNone, dbBuild
@@ -35,10 +38,13 @@ type
     manifest: string
     output: string
     query: string
-
-  PackageOutput = object
-    name: string
-    path: string
+    ## Options for 'spam index'
+    indexNixpkgs: string
+    indexSystem: string
+    indexScope: string
+    indexCacheUrl: string
+    indexConcurrent: int
+    verbose: bool
 
   OptionRecord = object
     name: string
@@ -47,6 +53,10 @@ type
   FileRecord = object
     path: string
     packages: seq[string]
+
+  PackageOutput = object
+    name: string
+    path: string
 
 proc zstdCompressBound(srcSize: csize_t): csize_t {.importc: "ZSTD_compressBound".}
 proc zstdCompress(
@@ -81,12 +91,17 @@ Usage:
   spam pkg [--db files.db] [--json] <query>
   spam db build --manifest packages.json --output files.db [--json]
   spam db build --manifest options.json --output options.db [--json]
+  spam index [--output files.db] [--nixpkgs <path>] [--cache-url <url>]
+             [--system <system>] [--scope <attr>] [--concurrent <n>] [--verbose]
   spam --help
 
 Commands:
   opt       Search an options.json produced by nixosOptionsDoc.
   pkg       Search a spam package-file database.
-  db build  Build a package-file or option database from JSON.
+  db build  Build a package-file or option database from a local manifest JSON.
+  index     Autonomously index nixpkgs by fetching file listings from the
+            binary cache. Equivalent to nix-index, but uses spam's bucket-
+            indexed database format for faster queries.
 
 Global options:
   -h, --help         Show this help text.
@@ -102,7 +117,17 @@ db build options:
       --manifest <path>  JSON package manifest or nixosOptionsDoc options.json.
       --output <path>    Database output path.
 
-Manifest formats:
+index options:
+      --output <path>      Database output path. Defaults to --db value.
+      --nixpkgs <path>     Nixpkgs path or expression for nix-env -f.
+                           Defaults to <nixpkgs>.
+      --cache-url <url>    Binary cache URL. Defaults to https://cache.nixos.org.
+      --system <system>    Override the target system (e.g. x86_64-linux).
+      --scope <attr>       Limit indexing to a single attr set (e.g. python3Packages).
+      --concurrent <n>     Maximum parallel HTTP requests (default: 32).
+      --verbose            Print progress to stderr.
+
+Manifest formats for 'db build':
   [
     {"attr":"hello","pname":"hello","version":"2.12","outputs":{"out":"/nix/store/...-hello-2.12"}}
   ]
@@ -120,7 +145,7 @@ proc defaultDatabasePath(): string =
 
 proc requireValue(option, value: string): string =
   if value.len == 0:
-    fail(option & " requires a path")
+    fail(option & " requires a value")
   value
 
 proc rememberQuery(config: var Config, value: string) =
@@ -136,6 +161,7 @@ proc parseCommand(config: var Config, args: var seq[string], value: string) =
     of "opt": config.command = cmdOpt
     of "pkg": config.command = cmdPkg
     of "db": config.command = cmdDb
+    of "index": config.command = cmdIndex
     else: fail("unknown command: " & value)
   elif config.command == cmdDb and args.len == 2:
     case value
@@ -146,10 +172,13 @@ proc parseCommand(config: var Config, args: var seq[string], value: string) =
 
 proc parseArgs(): Config =
   result.database = defaultDatabasePath()
+  result.indexCacheUrl = DefaultCacheUrl
+  result.indexNixpkgs = "<nixpkgs>"
+  result.indexConcurrent = MaxConcurrent
 
   var parser = initOptParser(
     shortNoVal = {'h'},
-    longNoVal = @["help", "json"],
+    longNoVal = @["help", "json", "verbose"],
   )
   var args: seq[string]
 
@@ -163,6 +192,8 @@ proc parseArgs(): Config =
         showHelp()
       of "json":
         result.jsonOutput = true
+      of "verbose":
+        result.verbose = true
       of "db":
         if result.optSource == optSourceJson:
           fail("opt accepts either --module-options or --db, not both")
@@ -177,6 +208,19 @@ proc parseArgs(): Config =
         result.manifest = requireValue("--manifest", value)
       of "output":
         result.output = requireValue("--output", value)
+      of "nixpkgs":
+        result.indexNixpkgs = requireValue("--nixpkgs", value)
+      of "cache-url":
+        result.indexCacheUrl = requireValue("--cache-url", value)
+      of "system":
+        result.indexSystem = requireValue("--system", value)
+      of "scope":
+        result.indexScope = requireValue("--scope", value)
+      of "concurrent":
+        let n = parseInt(requireValue("--concurrent", value))
+        if n < 1 or n > 256:
+          fail("--concurrent must be between 1 and 256")
+        result.indexConcurrent = n
       else:
         fail("unknown option: --" & key)
     of cmdEnd:
@@ -217,6 +261,8 @@ proc validate(config: Config) =
     if config.output.len == 0:
       fail("db build requires --output")
     validatePath(config.manifest, "manifest")
+  of cmdIndex:
+    discard # all index options have sensible defaults
   of cmdNone:
     discard
 
@@ -436,8 +482,10 @@ proc packageName(attr, pname, version, output: string): string =
   if output.len > 0 and output != "out":
     result &= "." & output
 
-proc addOutput(outputs: var seq[PackageOutput], attr, pname, version, output,
-    path: string) =
+proc addOutput(
+  outputs: var seq[PackageOutput],
+  attr, pname, version, output, path: string,
+) =
   if path.len == 0 or not dirExists(path):
     return
 
@@ -503,53 +551,81 @@ proc relativeStorePath(root, path: string): string =
   else:
     result = "/" & result
 
-proc packageFileRecords(outputs: seq[PackageOutput]): Table[string, HashSet[string]] =
+proc packageFileRecords(
+  outputs: seq[PackageOutput],
+): Table[string, HashSet[string]] =
   result = initTable[string, HashSet[string]]()
   for output in outputs:
-    for path in walkDirRec(output.path, yieldFilter = {pcFile, pcLinkToFile}):
-      let rel = relativeStorePath(output.path, path)
+    for filePath in walkDirRec(output.path, yieldFilter = {pcFile,
+        pcLinkToFile}):
+      let rel = relativeStorePath(output.path, filePath)
       if rel != "/":
         result.mgetOrPut(rel, initHashSet[string]()).incl(output.name)
 
-proc writePackagesDatabase(path: string, records: Table[string, HashSet[string]]) =
+proc fileEntriesToLines(entries: seq[FileEntry]): seq[string] =
+  ## Encode extended FileEntry records to database lines.
+  for e in entries:
+    result.add(encodeEntry(e))
+
+proc writePackagesDatabaseLegacy(
+  path: string,
+  records: Table[string, HashSet[string]],
+) =
+  ## Write a packages database in the legacy (path\tpkg,...) format.
   var paths = toSeq(records.keys)
   paths.sort()
 
   var lines: seq[string]
-  for path in paths:
-    var packages = toSeq(records[path])
+  for p in paths:
+    var packages = toSeq(records[p])
     packages.sort()
-    lines.add(path & "\t" & packages.join(","))
+    lines.add(p & "\t" & packages.join(","))
   writeIndexedDatabase(path, dbPackages, lines)
 
-proc parsePackages(lines: seq[string]): seq[FileRecord] =
-  for line in lines:
-    let tab = line.find('\t')
-    if tab < 0:
-      continue
-    result.add(FileRecord(
-      path: line[0 ..< tab],
-      packages: line[tab + 1 .. ^1].split(',').filterIt(it.len > 0),
-    ))
+proc writePackagesDatabaseExtended(path: string, entries: seq[FileEntry]) =
+  ## Write a packages database with full file metadata.
+  writeIndexedDatabase(path, dbPackages, fileEntriesToLines(entries))
 
-proc matchingPackages(records: seq[FileRecord], query: string): seq[FileRecord] =
+proc parsePackages(lines: seq[string]): seq[FileEntry] =
+  for line in lines:
+    let entry = decodeEntry(line)
+    if entry.path.len > 0:
+      result.add(entry)
+
+proc matchingPackages(records: seq[FileEntry], query: string): seq[FileEntry] =
   for record in records:
     if query in record.path:
       result.add(record)
 
-proc loadMatchingPackagesDatabase(path, query: string): seq[FileRecord] =
+proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
   matchingPackages(parsePackages(indexedBucketLines(path, dbPackages,
       query.queryBucket)), query)
 
-proc printPackages(records: seq[FileRecord], jsonOutput: bool) =
+proc printPackages(records: seq[FileEntry], jsonOutput: bool) =
   if jsonOutput:
     var output = newJArray()
     for record in records:
-      output.add( %* {"path": record.path, "packages": record.packages})
+      var item = %* {
+        "path": record.path,
+        "packages": record.packages,
+        "size": record.size,
+        "kind": $record.kind,
+        "executable": record.executable,
+      }
+      if record.target.len > 0:
+        item["target"] = %record.target
+      output.add(item)
     echo output.pretty()
   else:
     for record in records:
-      echo record.path & "\t" & record.packages.join(", ")
+      let sizeStr = if record.size > 0: $record.size else: "-"
+      let execFlag = if record.executable: "x" else: " "
+      let kindChar = case record.kind
+        of fkDirectory: "d"
+        of fkSymlink: "l"
+        else: execFlag
+      echo kindChar & " " & sizeStr & "\t" & record.path & "\t" &
+        record.packages.join(", ")
 
 proc countOptionShapes(manifest: JsonNode): tuple[options, other: int] =
   if manifest.kind != JObject:
@@ -583,12 +659,40 @@ proc buildDatabase(config: Config) =
     fail("manifest did not contain options or existing package output paths")
 
   let records = packageFileRecords(outputs)
-  writePackagesDatabase(config.output, records)
+  writePackagesDatabaseLegacy(config.output, records)
   if config.jsonOutput:
     echo( %* {"kind": "packages", "paths": records.len, "outputs": outputs.len,
         "output": config.output})
   else:
     stderr.writeLine(&"indexed {records.len} file paths from {outputs.len} outputs")
+
+proc runIndex(config: Config) =
+  ## Execute 'spam index': autonomous binary-cache indexing.
+  let outPath =
+    if config.output.len > 0: config.output
+    else: config.database
+
+  outPath.ensureParent()
+
+  var opts = defaultIndexOptions()
+  opts.cacheUrl = config.indexCacheUrl
+  opts.nixpkgs = config.indexNixpkgs
+  opts.system = config.indexSystem
+  opts.scope = config.indexScope
+  opts.maxConcurrent = config.indexConcurrent
+  opts.verbose = config.verbose
+
+  if opts.verbose:
+    stderr.writeLine("spam: starting autonomous index -> " & outPath)
+
+  let entries = waitFor buildIndexDatabase(opts)
+
+  writePackagesDatabaseExtended(outPath, entries)
+
+  if config.jsonOutput:
+    echo( %* {"kind": "packages", "files": entries.len, "output": outPath})
+  else:
+    stderr.writeLine(&"indexed {entries.len} file paths -> {outPath}")
 
 proc main() =
   let config = parseArgs()
@@ -608,6 +712,8 @@ proc main() =
       config.jsonOutput)
   of cmdDb:
     buildDatabase(config)
+  of cmdIndex:
+    runIndex(config)
   of cmdNone:
     discard
 
