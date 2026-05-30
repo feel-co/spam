@@ -12,6 +12,9 @@ spam - a utility to search nix packages and module options
 
 `spam db build --manifest [options.json] --output [options.db] [--json]`
 
+`spam index [--output` _files.db_ `] [--nixpkgs` _path_ `] [--system` _system_ `]`
+`          [--scope` _attr_ `] [--concurrent` _n_ `] [--no-follow-refs] [--verbose]`
+
 # OPTIONS
 `-h, --help`
 : Display help message
@@ -21,6 +24,9 @@ spam - a utility to search nix packages and module options
 
 `--db`
 : Path to a generated database. Defaults to `$XDG_CACHE_HOME/spam/files.db`.
+
+`--verbose`
+: Print progress to stderr.
 
 # OPTION SEARCH
 
@@ -80,6 +86,48 @@ Supported manifest shapes:
   }
 }
 ```
+
+# AUTONOMOUS INDEXING
+
+## SYNOPSIS
+
+`spam index [--output [files.db]] [--nixpkgs [path]] [--cache-url` _url_ `]`
+`          [--system [system]] [--scope [attr]] [--concurrent [n]]`
+`          [--no-follow-refs] [--verbose]`
+
+Enumerates packages from nixpkgs via `nix-env -qaP --xml --out-path`, then
+fetches file listings from a Nix binary cache (default: https://cache.nixos.org)
+using BFS reference traversal. Produces a spam database usable with `spam pkg`.
+
+Equivalent to `nix-index`, but uses spam's bucket-indexed zstd-compressed
+database for faster queries.
+
+## Options
+
+`--output [files.db]`
+: Database output path. Defaults to the `--db` path.
+
+`--nixpkgs [path]`
+: Nixpkgs path or expression for `nix-env -f`. Defaults to `<nixpkgs>`.
+
+`--cache-url` _url_
+: Binary cache URL. Defaults to `https://cache.nixos.org`.
+
+`--system [system]`
+: Override the target system (e.g. `x86_64-linux`).
+
+`--scope [attr]`
+: Limit indexing to a single attr set (e.g. `python3Packages`).
+
+`--concurrent [n]`
+: Maximum parallel HTTP requests (default: 32).
+
+`--no-follow-refs`
+: Only index direct package outputs; skip transitive store reference
+  traversal. Much faster. Enabled by default.
+
+`--verbose`
+: Print progress to stderr.
 
 # BUGS
 
