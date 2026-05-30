@@ -7,6 +7,8 @@ bin           = @["spam"]
 
 requires "nim >= 2.2.0"
 
+task test, "Run tests":
+  exec "nim c --path:src --run -r tests/test_cache.nim"
+
 task release, "Release build":
   exec "nimble build -d:release -d:ssl --opt:speed"
-#  exec "pandoc -s -o FIXME.1 doc/FIXME.man1.md"

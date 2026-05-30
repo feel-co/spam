@@ -6,42 +6,78 @@ import std/[asyncdispatch, httpclient, json, strutils, math, random]
 
 {.passL: "-lbrotlidec".}
 
-type BrotliDecoderResult = cint
+type
+  BrotliDecoderResult* = enum
+    brError = 0,
+    brSuccess = 1,
+    brNeedsMoreInput = 2,
+    brNeedsMoreOutput = 3,
 
-const
-  BrotliResultSuccess = BrotliDecoderResult(1)
-  BrotliResultNeedsOutput = BrotliDecoderResult(3)
+proc brotliDecoderCreateInstance(
+  allocFunc, freeFunc: pointer, opaque: pointer,
+): pointer {.importc: "BrotliDecoderCreateInstance", header: "brotli/decode.h".}
 
-proc brotliDecoderDecompress(
-  encodedSize: csize_t,
-  encodedBuffer: pointer,
-  decodedSize: ptr csize_t,
-  decodedBuffer: pointer,
-): BrotliDecoderResult {.importc: "BrotliDecoderDecompress".}
+proc brotliDecoderDestroyInstance(
+  state: pointer,
+) {.importc: "BrotliDecoderDestroyInstance", header: "brotli/decode.h".}
 
-proc brotliDecompress(data: string): string =
-  ## Decompress a Brotli-encoded string. Raises IOError on failure.
+proc brotliDecoderDecompressStream(
+  state: pointer,
+  availableIn: ptr csize_t,
+  nextIn: ptr pointer,
+  availableOut: ptr csize_t,
+  nextOut: ptr pointer,
+  totalOut: ptr csize_t,
+): BrotliDecoderResult {.discardable.} =
+  {.emit: "`result` = (unsigned char)BrotliDecoderDecompressStream((BrotliDecoderState*)`state`, `availableIn`, (const uint8_t**)`nextIn`, `availableOut`, (uint8_t**)`nextOut`, `totalOut`);".}
+
+proc brotliDecompress*(data: string): string =
+  ## Decompress a Brotli-encoded string using the streaming decoder API.
+  ## Raises IOError if decompression fails.
   if data.len == 0:
     return ""
 
-  # Brotli has no frame header with decompressed size; start at 8x and double.
-  var capacity = csize_t(max(data.len * 8, 4096))
+  let state = brotliDecoderCreateInstance(nil, nil, nil)
+  if state == nil:
+    raise newException(IOError, "brotli: failed to create decoder instance")
+
+  var
+    availableIn = csize_t(data.len)
+    nextIn: pointer = cast[pointer](unsafeAddr data[0])
+    output = newStringOfCap(int(data.len * 4))
+    totalOut: csize_t
+
   while true:
-    result = newString(int(capacity))
-    var outLen = capacity
-    let rc = brotliDecoderDecompress(
-      csize_t(data.len), unsafeAddr data[0],
-      addr outLen, addr result[0],
+    var
+      outChunk = newString(8192)
+      availableOut = csize_t(8192)
+      nextOut: pointer = cast[pointer](addr outChunk[0])
+    let rc = brotliDecoderDecompressStream(
+      state,
+      addr availableIn, addr nextIn,
+      addr availableOut, addr nextOut,
+      addr totalOut,
     )
-    if rc == BrotliResultSuccess:
-      result.setLen(int(outLen))
-      return
-    elif rc == BrotliResultNeedsOutput:
-      if capacity >= csize_t(64 * 1024 * 1024):
+    let consumed = 8192 - int(availableOut)
+    if consumed > 0:
+      outChunk.setLen(consumed)
+      output.add(outChunk)
+
+    case rc
+    of brSuccess:
+      brotliDecoderDestroyInstance(state)
+      return output
+    of brNeedsMoreOutput:
+      if output.len > 64 * 1024 * 1024:
+        brotliDecoderDestroyInstance(state)
         raise newException(IOError, "brotli output exceeds 64 MiB")
-      capacity = capacity * 2
-    else:
-      raise newException(IOError, "brotli decompression failed (result=" & $rc & ")")
+      continue
+    of brNeedsMoreInput:
+      brotliDecoderDestroyInstance(state)
+      raise newException(IOError, "brotli: truncated input stream")
+    of brError:
+      brotliDecoderDestroyInstance(state)
+      raise newException(IOError, "brotli: decoder error on input stream")
 
 const
   DefaultCacheUrl* = "https://cache.nixos.org"
