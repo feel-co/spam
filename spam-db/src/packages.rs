@@ -22,7 +22,7 @@ impl Default for FileKind {
   }
 }
 
-/// A file-to-package mapping from a packages database.
+/// A file-to-package mapping from a packages database or autonomous index.
 ///
 /// Extended databases (produced by `spam index`) include full metadata;
 /// legacy databases (from `spam db build`) only populate `path` and `packages`.
@@ -42,7 +42,7 @@ pub struct FileRecord {
   pub target: String,
 }
 
-/// Handle to an open spam packages database.
+/// Handle to an open spam packages database or autonomous index.
 ///
 /// Only the fixed-size bucket index is loaded into memory on construction.
 #[derive(Debug)]
@@ -55,14 +55,14 @@ impl PackagesDb {
     Self { db }
   }
 
-  /// Open the packages database at `path`.
+  /// Open the packages database or autonomous index at `path`.
   ///
-  /// Returns [`Error::InvalidDatabase`] if the file is not a packages database.
+  /// Returns [`Error::InvalidDatabase`] if the file is not queryable by `spam pkg`.
   pub fn open(path: impl AsRef<Path>) -> Result<Self> {
     let db = DbFile::open(path)?;
-    if db.kind != DbKind::Packages {
+    if db.kind != DbKind::Packages && db.kind != DbKind::Index {
       return Err(Error::InvalidDatabase(
-        "expected a packages database (kind = packages)".into(),
+        "expected a packages or index database".into(),
       ));
     }
     Ok(Self { db })

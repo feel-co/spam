@@ -7,12 +7,14 @@
 //! ## Database kinds
 //!
 //! - [`OptionsDb`]: NixOS module options, keyed by option name.
-//! - [`PackagesDb`]: Nix store file paths, keyed by path.
+//! - [`PackagesDb`]: Nix store file paths, keyed by path. Opens both
+//!   `packages` databases from `spam db build` and `index` databases from
+//!   `spam index`.
 //!
 //! ## File format
 //!
 //! ```text
-//! # spam-db-v2\t{options|packages}\n
+//! # spam-db-v2\t{options|packages|index}\n
 //! [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 //! [concatenated zstd-compressed bucket blobs]
 //! ```
@@ -32,6 +34,11 @@
 //!         }
 //!     }
 //!     SpamDb::Packages(db) => {
+//!         for rec in db.query("/bin/").unwrap() {
+//!             println!("{} -> {}", rec.path, rec.packages.join(", "));
+//!         }
+//!     }
+//!     SpamDb::Index(db) => {
 //!         for rec in db.query("/bin/").unwrap() {
 //!             println!("{} -> {}", rec.path, rec.packages.join(", "));
 //!         }
@@ -60,14 +67,16 @@ pub use packages::{FileKind, FileRecord, PackagesDb};
 /// Convenience alias for `Result<T, spam_db::Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A spam database of either kind, returned by [`SpamDb::open`] when the kind
-/// is not known at compile time.
+/// A spam database returned by [`SpamDb::open`] when the kind is not known at
+/// compile time.
 #[derive(Debug)]
 pub enum SpamDb {
   /// An options database (NixOS module options).
   Options(OptionsDb),
-  /// A packages database (file path to package name mappings).
+  /// A package-manifest database from `spam db build`.
   Packages(PackagesDb),
+  /// An autonomous package index from `spam index`.
+  Index(PackagesDb),
 }
 
 impl SpamDb {
@@ -77,6 +86,7 @@ impl SpamDb {
     match db.kind {
       DbKind::Options => Ok(SpamDb::Options(OptionsDb::from_file(db))),
       DbKind::Packages => Ok(SpamDb::Packages(PackagesDb::from_file(db))),
+      DbKind::Index => Ok(SpamDb::Index(PackagesDb::from_file(db))),
     }
   }
 
@@ -85,6 +95,7 @@ impl SpamDb {
     match self {
       SpamDb::Options(_) => DbKind::Options,
       SpamDb::Packages(_) => DbKind::Packages,
+      SpamDb::Index(_) => DbKind::Index,
     }
   }
 }

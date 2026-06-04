@@ -2,7 +2,7 @@ use std::{collections::HashSet, io::Write};
 
 /// Build a raw spam database in memory.
 ///
-/// `kind` must be `"options"` or `"packages"`. `lines` are the raw
+/// `kind` must be `"options"`, `"packages"`, or `"index"`. `lines` are the raw
 /// tab-separated records that will be placed into the appropriate buckets.
 fn build_db(kind: &str, lines: &[&str]) -> Vec<u8> {
   const BUCKETS: usize = 256;
@@ -92,6 +92,16 @@ fn auto_detect_opens_as_packages() {
   use spam_db::{DbKind, SpamDb};
   let db = SpamDb::open(f.path()).unwrap();
   assert_eq!(db.kind(), DbKind::Packages);
+}
+
+#[test]
+fn auto_detect_opens_as_index() {
+  let bytes = build_db("index", &["/bin/hello\thello-2.12"]);
+  let f = TempFile::write("spam_test_auto_index.db", &bytes);
+
+  use spam_db::{DbKind, SpamDb};
+  let db = SpamDb::open(f.path()).unwrap();
+  assert_eq!(db.kind(), DbKind::Index);
 }
 
 #[test]
@@ -185,6 +195,13 @@ fn options_record_without_summary() {
 fn packages_db_opens_successfully() {
   let bytes = build_db("packages", &["/bin/hello\thello-2.12"]);
   let f = TempFile::write("spam_test_pkg_open.db", &bytes);
+  spam_db::PackagesDb::open(f.path()).unwrap();
+}
+
+#[test]
+fn packages_db_opens_index_successfully() {
+  let bytes = build_db("index", &["/bin/hello\thello-2.12"]);
+  let f = TempFile::write("spam_test_index_open.db", &bytes);
   spam_db::PackagesDb::open(f.path()).unwrap();
 }
 

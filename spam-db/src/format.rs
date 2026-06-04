@@ -22,8 +22,10 @@ use crate::{Error, Result};
 pub enum DbKind {
   /// Options database produced from `nixosOptionsDoc`.
   Options,
-  /// Package-file database mapping file paths to package names.
+  /// Package-file database built from a local manifest via `spam db build`.
   Packages,
+  /// Autonomous package index produced by `spam index`.
+  Index,
 }
 
 /// An open spam database file.
@@ -158,6 +160,7 @@ fn parse_kind(header: &str) -> Result<DbKind> {
   match kind_str {
     "options" => Ok(DbKind::Options),
     "packages" => Ok(DbKind::Packages),
+    "index" => Ok(DbKind::Index),
     other => Err(Error::InvalidDatabase(format!(
       "unknown database kind: {other}"
     ))),
