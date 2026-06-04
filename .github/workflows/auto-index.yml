@@ -10,7 +10,7 @@ on:
 jobs:
   index:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +67,8 @@ jobs:
         spam index \
           --output ./spam-index-${{ matrix.system }} \
           --system ${{ matrix.system }} \
+          --concurrent 8 \
+          --no-follow-refs \
           --verbose
 
     - name: Upload index artifact
