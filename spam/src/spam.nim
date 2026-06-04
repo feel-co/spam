@@ -1,5 +1,5 @@
-import std/[algorithm, asyncdispatch, json, os, parseopt, sequtils, sets,
-    strformat, strutils, tables]
+import std/[algorithm, asyncdispatch, hashes, json, os, parseopt, sequtils,
+    sets, strformat, strutils, tables]
 import filemeta
 import cache
 import index
@@ -12,8 +12,10 @@ const
   IndexBuckets = 256
   IndexEntrySize = 8
   IndexSize = IndexBuckets * IndexEntrySize
-  ZstdContentSizeError = uint64.high
-  ZstdContentSizeUnknown = uint64.high - 1
+  PackageSpoolPartitions = 256
+  ZstdBufferSize = 128 * 1024
+  ZstdContentSizeUnknown = uint64.high
+  ZstdContentSizeError = uint64.high - 1
 
 type
   Command = enum
@@ -51,22 +53,34 @@ type
     name: string
     summary: string
 
-  FileRecord = object
-    path: string
-    packages: seq[string]
-
   PackageOutput = object
     name: string
     path: string
 
-proc zstdCompressBound(srcSize: csize_t): csize_t {.importc: "ZSTD_compressBound".}
-proc zstdCompress(
-  dst: pointer,
-  dstCapacity: csize_t,
-  src: pointer,
-  srcSize: csize_t,
-  compressionLevel: cint,
-): csize_t {.importc: "ZSTD_compress".}
+  ZstdInBuffer = object
+    src: pointer
+    size: csize_t
+    pos: csize_t
+
+  ZstdOutBuffer = object
+    dst: pointer
+    size: csize_t
+    pos: csize_t
+
+  IndexedDatabaseBuilder = object
+    path: string
+    kind: DbKind
+    tempDir: string
+    bucketPaths: array[IndexBuckets, string]
+    bucketFiles: array[IndexBuckets, File]
+    bucketFilesOpen: bool
+
+  PackageEntrySpool = object
+    tempDir: string
+    partitionPaths: array[PackageSpoolPartitions, string]
+    partitionFiles: array[PackageSpoolPartitions, File]
+    partitionFilesOpen: bool
+
 proc zstdGetFrameContentSize(src: pointer, srcSize: csize_t): uint64 {.
     importc: "ZSTD_getFrameContentSize".}
 proc zstdDecompress(
@@ -77,6 +91,19 @@ proc zstdDecompress(
 ): csize_t {.importc: "ZSTD_decompress".}
 proc zstdIsError(code: csize_t): cuint {.importc: "ZSTD_isError".}
 proc zstdGetErrorName(code: csize_t): cstring {.importc: "ZSTD_getErrorName".}
+proc zstdCreateCStream(): pointer {.importc: "ZSTD_createCStream".}
+proc zstdFreeCStream(stream: pointer): csize_t {.importc: "ZSTD_freeCStream".}
+proc zstdInitCStream(stream: pointer, compressionLevel: cint): csize_t {.
+    importc: "ZSTD_initCStream".}
+proc zstdSetPledgedSrcSize(stream: pointer, pledgedSrcSize: uint64): csize_t {.
+    importc: "ZSTD_CCtx_setPledgedSrcSize".}
+proc zstdCompressStream(
+  stream: pointer,
+  output: ptr ZstdOutBuffer,
+  input: ptr ZstdInBuffer,
+): csize_t {.importc: "ZSTD_compressStream".}
+proc zstdEndStream(stream: pointer, output: ptr ZstdOutBuffer): csize_t {.
+    importc: "ZSTD_endStream".}
 
 proc fail(message: string) {.noreturn.} =
   stderr.writeLine("spam: " & message)
@@ -93,7 +120,8 @@ Usage:
   spam db build --manifest packages.json --output files.db [--json]
   spam db build --manifest options.json --output options.db [--json]
   spam index [--output files.db] [--nixpkgs <path>] [--cache-url <url>]
-             [--system <system>] [--scope <attr>] [--concurrent <n>] [--verbose]
+             [--system <system>] [--scope <attr>] [--concurrent <n>]
+             [--follow-refs] [--verbose]
   spam --help
 
 Commands:
@@ -126,8 +154,9 @@ index options:
       --system <system>    Override the target system (e.g. x86_64-linux).
       --scope <attr>       Limit indexing to a single attr set (e.g. python3Packages).
       --concurrent <n>     Maximum parallel HTTP requests (default: 32).
+      --follow-refs        Also index transitive references from each package.
       --no-follow-refs     Only index direct package outputs, skip transitive
-                           reference traversal (much faster). Enabled by default.
+                            reference traversal (much faster). Enabled by default.
       --verbose            Print progress to stderr.
 
 Manifest formats for 'db build':
@@ -181,7 +210,7 @@ proc parseArgs(): Config =
 
   var parser = initOptParser(
     shortNoVal = {'h'},
-    longNoVal = @["help", "json", "verbose", "no-follow-refs"],
+    longNoVal = @["help", "json", "verbose", "follow-refs", "no-follow-refs"],
   )
   var args: seq[string]
 
@@ -224,6 +253,8 @@ proc parseArgs(): Config =
         if n < 1 or n > 256:
           fail("--concurrent must be between 1 and 256")
         result.indexConcurrent = n
+      of "follow-refs":
+        result.indexFollowRefs = true
       of "no-follow-refs":
         result.indexFollowRefs = false
       else:
@@ -292,17 +323,6 @@ proc getUint32(data: string, offset: int): uint32 =
   for shift in countup(0, 24, 8):
     result = result or (uint32(data[offset + shift div 8]) shl shift)
 
-proc zstdCompress(input: string): string =
-  if input.len == 0:
-    return ""
-
-  result = newString(int(zstdCompressBound(csize_t(input.len))))
-  let compressedSize = zstdCompress(addr result[0], csize_t(result.len),
-    unsafeAddr input[0], csize_t(input.len), 3)
-  if zstdIsError(compressedSize) != 0:
-    fail("zstd compression failed: " & $zstdGetErrorName(compressedSize))
-  result.setLen(int(compressedSize))
-
 proc zstdDecompress(input: string): string =
   if input.len == 0:
     return ""
@@ -328,6 +348,227 @@ proc zstdDecompress(input: string): string =
 proc searchableKey(line: string): string =
   let tab = line.find('\t')
   if tab < 0: line else: line[0 ..< tab]
+
+proc writeRaw(file: File, data: string, label: string) =
+  if data.len == 0:
+    return
+
+  let written = file.writeBuffer(unsafeAddr data[0], data.len)
+  if written != data.len:
+    fail("failed to write " & label)
+
+proc writeRaw(file: File, data: pointer, length: int, label: string) =
+  if length == 0:
+    return
+
+  let written = file.writeBuffer(data, length)
+  if written != length:
+    fail("failed to write " & label)
+
+proc checkedZstd(code: csize_t, action: string) =
+  if zstdIsError(code) != 0:
+    fail(action & ": " & $zstdGetErrorName(code))
+
+proc zstdCompressFile(inputPath: string, output: File): uint32 =
+  let stream = zstdCreateCStream()
+  if stream == nil:
+    fail("zstd compression failed: could not create stream")
+  defer:
+    discard zstdFreeCStream(stream)
+
+  checkedZstd(zstdInitCStream(stream, 3), "zstd compression failed")
+  checkedZstd(zstdSetPledgedSrcSize(stream, uint64(getFileSize(inputPath))),
+    "zstd compression failed")
+
+  var input = open(inputPath, fmRead)
+  defer: input.close()
+
+  var
+    inputChunk = newString(ZstdBufferSize)
+    outputChunk = newString(ZstdBufferSize)
+    compressedSize = 0'u64
+
+  while true:
+    let read = input.readBuffer(addr inputChunk[0], inputChunk.len)
+    if read == 0:
+      break
+
+    var inputBuffer = ZstdInBuffer(
+      src: addr inputChunk[0],
+      size: csize_t(read),
+      pos: 0,
+    )
+    while inputBuffer.pos < inputBuffer.size:
+      var outputBuffer = ZstdOutBuffer(
+        dst: addr outputChunk[0],
+        size: csize_t(outputChunk.len),
+        pos: 0,
+      )
+      checkedZstd(zstdCompressStream(stream, addr outputBuffer,
+          addr inputBuffer),
+        "zstd compression failed")
+      output.writeRaw(addr outputChunk[0], int(outputBuffer.pos), "database")
+      compressedSize += uint64(outputBuffer.pos)
+      if compressedSize > uint32.high.uint64:
+        fail("database is too large for the index")
+
+  while true:
+    var outputBuffer = ZstdOutBuffer(
+      dst: addr outputChunk[0],
+      size: csize_t(outputChunk.len),
+      pos: 0,
+    )
+    let remaining = zstdEndStream(stream, addr outputBuffer)
+    checkedZstd(remaining, "zstd compression failed")
+    output.writeRaw(addr outputChunk[0], int(outputBuffer.pos), "database")
+    compressedSize += uint64(outputBuffer.pos)
+    if compressedSize > uint32.high.uint64:
+      fail("database is too large for the index")
+    if remaining == 0:
+      break
+
+  uint32(compressedSize)
+
+proc cleanup(builder: var IndexedDatabaseBuilder) =
+  if builder.bucketFilesOpen:
+    for i in 0 ..< IndexBuckets:
+      try:
+        builder.bucketFiles[i].close()
+      except IOError:
+        discard
+    builder.bucketFilesOpen = false
+
+  if builder.tempDir.len > 0 and dirExists(builder.tempDir):
+    removeDir(builder.tempDir)
+
+proc makeTempDir(): string =
+  let base = getTempDir() / ("spam-db-" & $getCurrentProcessId())
+  var suffix = 0
+  while true:
+    result = base & "-" & $suffix
+    if not dirExists(result) and not fileExists(result):
+      createDir(result)
+      return
+    inc suffix
+
+proc initIndexedDatabaseBuilder(path: string,
+    kind: DbKind): IndexedDatabaseBuilder =
+  result.path = path
+  result.kind = kind
+  result.tempDir = makeTempDir()
+  for i in 0 ..< IndexBuckets:
+    result.bucketPaths[i] = result.tempDir / $i
+    result.bucketFiles[i] = open(result.bucketPaths[i], fmWrite)
+  result.bucketFilesOpen = true
+
+proc addLine(builder: var IndexedDatabaseBuilder, line: string) =
+  var seenBytes: set[char]
+  for byte in line.searchableKey():
+    if byte notin seenBytes:
+      seenBytes.incl(byte)
+      builder.bucketFiles[ord(byte)].writeRaw(line, "bucket spool")
+      builder.bucketFiles[ord(byte)].writeRaw("\n", "bucket spool")
+
+proc closeBucketFiles(builder: var IndexedDatabaseBuilder) =
+  if not builder.bucketFilesOpen:
+    return
+  for i in 0 ..< IndexBuckets:
+    builder.bucketFiles[i].close()
+  builder.bucketFilesOpen = false
+
+proc finish(builder: var IndexedDatabaseBuilder) =
+  builder.path.ensureParent()
+  builder.closeBucketFiles()
+
+  var output = open(builder.path, fmWrite)
+  defer: output.close()
+
+  let headerLine = header(builder.kind) & "\n"
+  output.writeRaw(headerLine, "database header")
+  output.writeRaw(newString(IndexSize), "database index")
+
+  var
+    index = newStringOfCap(IndexSize)
+    offset = 0'u32
+
+  for i in 0 ..< IndexBuckets:
+    let length =
+      if getFileSize(builder.bucketPaths[i]) == 0: 0'u32
+      else: zstdCompressFile(builder.bucketPaths[i], output)
+    if offset.uint64 + length.uint64 > uint32.high.uint64:
+      fail("database is too large for the index")
+    index.add(putUint32(offset))
+    index.add(putUint32(length))
+    offset += length
+
+  output.setFilePos(headerLine.len)
+  output.writeRaw(index, "database index")
+  builder.cleanup()
+
+proc cleanup(spool: var PackageEntrySpool) =
+  if spool.partitionFilesOpen:
+    for i in 0 ..< PackageSpoolPartitions:
+      try:
+        spool.partitionFiles[i].close()
+      except IOError:
+        discard
+    spool.partitionFilesOpen = false
+
+  if spool.tempDir.len > 0 and dirExists(spool.tempDir):
+    removeDir(spool.tempDir)
+
+proc initPackageEntrySpool(): PackageEntrySpool =
+  result.tempDir = makeTempDir()
+  for i in 0 ..< PackageSpoolPartitions:
+    result.partitionPaths[i] = result.tempDir / $i
+    result.partitionFiles[i] = open(result.partitionPaths[i], fmWrite)
+  result.partitionFilesOpen = true
+
+proc partitionFor(path: string): int =
+  int(uint(hash(path)) and uint(PackageSpoolPartitions - 1))
+
+proc addEntry(spool: var PackageEntrySpool, entry: FileEntry) =
+  let partition = partitionFor(entry.path)
+  spool.partitionFiles[partition].writeRaw(encodeEntry(entry), "entry spool")
+  spool.partitionFiles[partition].writeRaw("\n", "entry spool")
+
+proc closePartitionFiles(spool: var PackageEntrySpool) =
+  if not spool.partitionFilesOpen:
+    return
+  for i in 0 ..< PackageSpoolPartitions:
+    spool.partitionFiles[i].close()
+  spool.partitionFilesOpen = false
+
+proc mergeInto(
+  spool: var PackageEntrySpool,
+  builder: var IndexedDatabaseBuilder,
+): int =
+  spool.closePartitionFiles()
+
+  for i in 0 ..< PackageSpoolPartitions:
+    if getFileSize(spool.partitionPaths[i]) == 0:
+      continue
+
+    var
+      packagesByPath = initTable[string, HashSet[string]]()
+      metadataByPath = initTable[string, FileEntry]()
+
+    for line in lines(spool.partitionPaths[i]):
+      let entry = decodeEntry(line)
+      if entry.path.len == 0:
+        continue
+      metadataByPath[entry.path] = entry
+      for packageName in entry.packages:
+        packagesByPath.mgetOrPut(entry.path, initHashSet[string]()).incl(packageName)
+
+    var paths = toSeq(packagesByPath.keys)
+    paths.sort()
+    for path in paths:
+      var entry = metadataByPath[path]
+      entry.packages = toSeq(packagesByPath[path])
+      entry.packages.sort()
+      builder.addLine(encodeEntry(entry))
+      inc result
 
 proc readExact(file: File, path: string, length: int): string =
   if length == 0:
@@ -368,34 +609,12 @@ proc queryBucket(query: string): int =
   if query.len == 0: 0 else: ord(query[0])
 
 proc writeIndexedDatabase(path: string, kind: DbKind, lines: seq[string]) =
-  path.ensureParent()
+  var builder = initIndexedDatabaseBuilder(path, kind)
+  defer: builder.cleanup()
 
-  var buckets: array[IndexBuckets, seq[string]]
   for line in lines:
-    var seenBytes: set[char]
-    let key = line.searchableKey()
-    for byte in key:
-      if byte notin seenBytes:
-        seenBytes.incl(byte)
-        buckets[ord(byte)].add(line)
-
-  var
-    index = newStringOfCap(IndexSize)
-    payload = ""
-    offset = 0'u32
-
-  for bucket in buckets:
-    let compressed =
-      if bucket.len == 0: ""
-      else: zstdCompress(bucket.join("\n") & "\n")
-    if offset.uint64 + compressed.len.uint64 > uint32.high.uint64:
-      fail("database is too large for the index")
-    index.add(putUint32(offset))
-    index.add(putUint32(uint32(compressed.len)))
-    payload.add(compressed)
-    offset += uint32(compressed.len)
-
-  writeFile(path, header(kind) & "\n" & index & payload)
+    builder.addLine(line)
+  builder.finish()
 
 proc compact(value: string): string =
   value.splitWhitespace().join(" ")
@@ -567,11 +786,6 @@ proc packageFileRecords(
       if rel != "/":
         result.mgetOrPut(rel, initHashSet[string]()).incl(output.name)
 
-proc fileEntriesToLines(entries: seq[FileEntry]): seq[string] =
-  ## Encode extended FileEntry records to database lines.
-  for e in entries:
-    result.add(encodeEntry(e))
-
 proc writePackagesDatabaseLegacy(
   path: string,
   records: Table[string, HashSet[string]],
@@ -586,10 +800,6 @@ proc writePackagesDatabaseLegacy(
     packages.sort()
     lines.add(p & "\t" & packages.join(","))
   writeIndexedDatabase(path, dbPackages, lines)
-
-proc writePackagesDatabaseExtended(path: string, entries: seq[FileEntry]) =
-  ## Write a packages database with full file metadata.
-  writeIndexedDatabase(path, dbPackages, fileEntriesToLines(entries))
 
 proc parsePackages(lines: seq[string]): seq[FileEntry] =
   for line in lines:
@@ -691,14 +901,24 @@ proc runIndex(config: Config) =
   if opts.verbose:
     stderr.writeLine("spam: starting autonomous index -> " & outPath)
 
-  let entries = waitFor buildIndexDatabase(opts)
+  var spool = initPackageEntrySpool()
+  defer: spool.cleanup()
 
-  writePackagesDatabaseExtended(outPath, entries)
+  let rawEntries = waitFor buildIndexDatabase(opts, proc(entry: FileEntry) =
+    spool.addEntry(entry)
+  )
+
+  var builder = initIndexedDatabaseBuilder(outPath, dbPackages)
+  defer: builder.cleanup()
+  let entries = spool.mergeInto(builder)
+
+  builder.finish()
 
   if config.jsonOutput:
-    echo( %* {"kind": "packages", "files": entries.len, "output": outPath})
+    echo( %* {"kind": "packages", "files": entries, "entries": rawEntries,
+        "output": outPath})
   else:
-    stderr.writeLine(&"indexed {entries.len} file paths -> {outPath}")
+    stderr.writeLine(&"indexed {entries} file paths ({rawEntries} entries) -> {outPath}")
 
 proc main() =
   let config = parseArgs()

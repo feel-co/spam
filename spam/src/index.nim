@@ -4,11 +4,11 @@
 ## recursive reference traversal (BFS workset) to discover transitive
 ## dependencies, fetching file listings from the binary cache for each.
 ##
-## The result is a seq[FileEntry] suitable for writing to a spam packages
-## database via writeIndexedDatabase.
+## File entries are emitted to the caller as they are fetched so large indexes
+## do not need to retain all package metadata in memory.
 
-import std/[algorithm, asyncdispatch, os, osproc, parsexml, sequtils, sets,
-    streams, strutils, syncio, tables]
+import std/[asyncdispatch, os, osproc, parsexml, sets, streams, strutils,
+    syncio, tables]
 import cache
 import filemeta
 
@@ -158,15 +158,15 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
 proc indexWithCache*(
   outputs: seq[StoreOutput],
   opts: IndexOptions,
-): Future[seq[FileEntry]] {.async.} =
+  emitEntry: proc(entry: FileEntry),
+): Future[int] {.async.} =
   ## Perform BFS reference traversal starting from `outputs`.
   ##
-  ## For each store path:
-  ##   1. Fetch .narinfo to get direct references.
-  ##   2. Fetch .ls to get the file listing with metadata.
-  ##   3. Add referenced hashes to the workset if not yet visited.
+  ## For each store path, fetch the binary cache file listing and emit entries
+  ## as soon as they are available. When followRefs is enabled, also fetch
+  ## .narinfo and enqueue direct references.
   ##
-  ## Returns a deduplicated seq of FileEntry with full metadata.
+  ## Returns the number of emitted file entries.
   let client = newCacheClient(opts.cacheUrl)
 
   # visited: hashes we've already fetched or enqueued
@@ -185,11 +185,6 @@ proc indexWithCache*(
       hashToAttr[o.hash] = o.attr & (if o.output != "out": "." &
           o.output else: "")
 
-  # path -> set of package attr names
-  var fileTable = initTable[string, HashSet[string]]()
-  # path -> LsEntry (for metadata: size, kind, exec, target)
-  var metaTable = initTable[string, LsEntry]()
-
   var processed = 0
 
   while queue.len > 0:
@@ -201,13 +196,16 @@ proc indexWithCache*(
     var narFutures: seq[Future[NarInfo]]
     var lsFutures: seq[Future[seq[LsEntry]]]
     for hash in batch:
-      narFutures.add(client.fetchNarInfo(hash))
+      if opts.followRefs:
+        narFutures.add(client.fetchNarInfo(hash))
       lsFutures.add(client.fetchFileListing(hash))
 
     # Await all futures
     for i, hash in batch:
       try:
-        let narInfo = await narFutures[i]
+        var narInfo: NarInfo
+        if opts.followRefs:
+          narInfo = await narFutures[i]
         let entries = await lsFutures[i]
 
         inc processed
@@ -221,21 +219,32 @@ proc indexWithCache*(
               visited.incl(refHash)
               queue.add(refHash)
 
-        # The attr name for this path: use hashToAttr if top-level, else use storePath basename
+        # The attr name for this path: use hashToAttr if top-level, else use storePath basename.
         let attr =
           if hash in hashToAttr: hashToAttr[hash]
-          else:
+          elif narInfo.storePath.len > 0:
             let name = narInfo.storePath.lastPathPart()
             let dash = name.find('-')
             if dash > 0: name[dash + 1 .. ^1] else: name
+          else:
+            hash
 
-        # Merge file entries into the deduplication tables
         for entry in entries:
-          # Skip directory entries from the merge (they clutter queries)
           if entry.kind == "directory":
             continue
-          metaTable[entry.path] = entry
-          fileTable.mgetOrPut(entry.path, initHashSet[string]()).incl(attr)
+          let kind =
+            if entry.kind == "symlink": fkSymlink
+            elif entry.kind == "directory": fkDirectory
+            else: fkRegular
+          emitEntry(FileEntry(
+            path: entry.path,
+            size: entry.size,
+            kind: kind,
+            executable: entry.executable,
+            target: entry.target,
+            packages: @[attr],
+          ))
+          inc result
 
       except Exception as e:
         # Catch both CatchableError and Defect (e.g. AssertionDefect from
@@ -251,32 +260,15 @@ proc indexWithCache*(
 
   if opts.verbose:
     stderr.writeLine("spam: traversal complete. visited=" & $visited.len &
-      " unique paths, files=" & $fileTable.len)
-
-  # Build the final FileEntry seq
-  var paths = toSeq(fileTable.keys)
-  paths.sort()
-
-  for path in paths:
-    let pkgs = toSeq(fileTable[path])
-    let meta = metaTable.getOrDefault(path)
-    let kind =
-      if meta.kind == "symlink": fkSymlink
-      elif meta.kind == "directory": fkDirectory
-      else: fkRegular
-    result.add(FileEntry(
-      path: path,
-      size: meta.size,
-      kind: kind,
-      executable: meta.executable,
-      target: meta.target,
-      packages: pkgs,
-    ))
+      " unique paths, files=" & $result)
 
 
-proc buildIndexDatabase*(opts: IndexOptions): Future[seq[FileEntry]] {.async.} =
+proc buildIndexDatabase*(
+  opts: IndexOptions,
+  emitEntry: proc(entry: FileEntry),
+): Future[int] {.async.} =
   ## Top-level entry: enumerate packages via nix-env, then index via binary cache.
   let outputs = enumeratePackages(opts)
   if opts.verbose:
     stderr.writeLine("spam: enumerated " & $outputs.len & " store outputs")
-  return await indexWithCache(outputs, opts)
+  return await indexWithCache(outputs, opts, emitEntry)
