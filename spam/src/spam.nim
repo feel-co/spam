@@ -28,7 +28,7 @@ type
     optSourceNone, optSourceJson, optSourceDb
 
   DbKind = enum
-    dbOptions, dbPackages
+    dbOptions, dbPackages, dbIndex
 
   Config = object
     command: Command
@@ -126,11 +126,11 @@ Usage:
 
 Commands:
   opt       Search an options.json produced by nixosOptionsDoc.
-  pkg       Search a spam package-file database.
+  pkg       Search a package-manifest database or autonomous index.
   db build  Build a package-file or option database from a local manifest JSON.
   index     Autonomously index nixpkgs by fetching file listings from the
-            binary cache. Equivalent to nix-index, but uses spam's bucket-
-            indexed database format for faster queries.
+            binary cache. Produces an index database, separate from databases
+            produced by 'spam db build'.
 
 Global options:
   -h, --help         Show this help text.
@@ -306,6 +306,7 @@ proc header(kind: DbKind): string =
   case kind
   of dbOptions: DbMagic & "\toptions"
   of dbPackages: DbMagic & "\tpackages"
+  of dbIndex: DbMagic & "\tindex"
 
 proc ensureParent(path: string) =
   let dir = path.parentDir()
@@ -607,6 +608,18 @@ proc indexedBucketLines(path: string, kind: DbKind, bucket: int): seq[string] =
 proc queryBucket(query: string): int =
   if query.len == 0: 0 else: ord(query[0])
 
+proc packageSearchKind(path: string): DbKind =
+  var file = open(path, fmRead)
+  defer: file.close()
+
+  let headerLine = file.readLine()
+  if headerLine == header(dbPackages):
+    dbPackages
+  elif headerLine == header(dbIndex):
+    dbIndex
+  else:
+    fail("unsupported package database format: " & path)
+
 proc writeIndexedDatabase(path: string, kind: DbKind, lines: seq[string]) =
   var builder = initIndexedDatabaseBuilder(path, kind)
   defer: builder.cleanup()
@@ -812,7 +825,7 @@ proc matchingPackages(records: seq[FileEntry], query: string): seq[FileEntry] =
       result.add(record)
 
 proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
-  matchingPackages(parsePackages(indexedBucketLines(path, dbPackages,
+  matchingPackages(parsePackages(indexedBucketLines(path, path.packageSearchKind,
       query.queryBucket)), query)
 
 proc printPackages(records: seq[FileEntry], jsonOutput: bool) =
@@ -907,14 +920,14 @@ proc runIndex(config: Config) =
     spool.addEntry(entry)
   )
 
-  var builder = initIndexedDatabaseBuilder(outPath, dbPackages)
+  var builder = initIndexedDatabaseBuilder(outPath, dbIndex)
   defer: builder.cleanup()
   let entries = spool.mergeInto(builder)
 
   builder.finish()
 
   if config.jsonOutput:
-    echo( %* {"kind": "packages", "files": entries, "entries": rawEntries,
+    echo( %* {"kind": "index", "files": entries, "entries": rawEntries,
         "output": outPath})
   else:
     stderr.writeLine(&"indexed {entries} file paths ({rawEntries} entries) -> {outPath}")
