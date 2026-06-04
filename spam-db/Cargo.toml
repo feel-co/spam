@@ -1,6 +1,6 @@
 [package]
 name = "spam-db"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Parser and query library for SPAM databases"
 license = "MPL-2.0"
