@@ -7,10 +7,10 @@ import index
 {.passL: "-lzstd".}
 
 const
-  DbMagic = "# spam-db-v1"
+  DbMagic = "# spam-db-v2"
   DefaultDbName = "spam/files.db"
   IndexBuckets = 256
-  IndexEntrySize = 8
+  IndexEntrySize = 16
   IndexSize = IndexBuckets * IndexEntrySize
   PackageSpoolPartitions = 256
   ZstdBufferSize = 128 * 1024
@@ -312,16 +312,16 @@ proc ensureParent(path: string) =
   if dir.len > 0:
     createDir(dir)
 
-proc putUint32(value: uint32): string =
-  for shift in countup(0, 24, 8):
-    result.add(char((value shr shift) and 0xff'u32))
+proc putUint64(value: uint64): string =
+  for shift in countup(0, 56, 8):
+    result.add(char((value shr shift) and 0xff'u64))
 
-proc getUint32(data: string, offset: int): uint32 =
-  if offset + 4 > data.len:
+proc getUint64(data: string, offset: int): uint64 =
+  if offset + 8 > data.len:
     fail("truncated database index")
 
-  for shift in countup(0, 24, 8):
-    result = result or (uint32(data[offset + shift div 8]) shl shift)
+  for shift in countup(0, 56, 8):
+    result = result or (uint64(data[offset + shift div 8]) shl shift)
 
 proc zstdDecompress(input: string): string =
   if input.len == 0:
@@ -369,7 +369,7 @@ proc checkedZstd(code: csize_t, action: string) =
   if zstdIsError(code) != 0:
     fail(action & ": " & $zstdGetErrorName(code))
 
-proc zstdCompressFile(inputPath: string, output: File): uint32 =
+proc zstdCompressFile(inputPath: string, output: File): uint64 =
   let stream = zstdCreateCStream()
   if stream == nil:
     fail("zstd compression failed: could not create stream")
@@ -409,8 +409,6 @@ proc zstdCompressFile(inputPath: string, output: File): uint32 =
         "zstd compression failed")
       output.writeRaw(addr outputChunk[0], int(outputBuffer.pos), "database")
       compressedSize += uint64(outputBuffer.pos)
-      if compressedSize > uint32.high.uint64:
-        fail("database is too large for the index")
 
   while true:
     var outputBuffer = ZstdOutBuffer(
@@ -422,12 +420,10 @@ proc zstdCompressFile(inputPath: string, output: File): uint32 =
     checkedZstd(remaining, "zstd compression failed")
     output.writeRaw(addr outputChunk[0], int(outputBuffer.pos), "database")
     compressedSize += uint64(outputBuffer.pos)
-    if compressedSize > uint32.high.uint64:
-      fail("database is too large for the index")
     if remaining == 0:
       break
 
-  uint32(compressedSize)
+  compressedSize
 
 proc cleanup(builder: var IndexedDatabaseBuilder) =
   if builder.bucketFilesOpen:
@@ -489,16 +485,14 @@ proc finish(builder: var IndexedDatabaseBuilder) =
 
   var
     index = newStringOfCap(IndexSize)
-    offset = 0'u32
+    offset = 0'u64
 
   for i in 0 ..< IndexBuckets:
     let length =
-      if getFileSize(builder.bucketPaths[i]) == 0: 0'u32
+      if getFileSize(builder.bucketPaths[i]) == 0: 0'u64
       else: zstdCompressFile(builder.bucketPaths[i], output)
-    if offset.uint64 + length.uint64 > uint32.high.uint64:
-      fail("database is too large for the index")
-    index.add(putUint32(offset))
-    index.add(putUint32(length))
+    index.add(putUint64(offset))
+    index.add(putUint64(length))
     offset += length
 
   output.setFilePos(headerLine.len)
@@ -594,8 +588,13 @@ proc indexedBucketLines(path: string, kind: DbKind, bucket: int): seq[string] =
 
   let entry = bucket * IndexEntrySize
   let
-    offset = int(getUint32(index, entry))
-    length = int(getUint32(index, entry + 4))
+    offset64 = getUint64(index, entry)
+    length64 = getUint64(index, entry + 8)
+  if offset64 > uint64(int.high) or length64 > uint64(int.high):
+    fail("database bucket is too large for this platform")
+  let
+    offset = int(offset64)
+    length = int(length64)
   if length == 0:
     return
 
