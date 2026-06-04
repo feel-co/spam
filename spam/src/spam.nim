@@ -1,3 +1,137 @@
+## spam - search Nix package files and module options
+##
+## `spam` searches NixOS module options, package-manifest file databases, and
+## autonomous package indexes.
+##
+## Usage
+## =====
+##
+## ```
+##
+##   spam opt --module-options options.json QUERY
+##   spam opt --db options.db QUERY
+##   spam pkg --db files.db QUERY
+##   spam db build --manifest packages.json --output files.db
+##   spam db build --manifest options.json --output options.db
+##   spam index --output files.db --nixpkgs PATH --cache-url URL
+##              --system SYSTEM --scope ATTR --concurrent N
+##              --follow-refs --verbose
+## ```
+##
+## `--json` may be added to search and database build commands.
+##
+## Global Options
+## ==============
+##
+## `-h`, `--help`
+##   Display the help message.
+##
+## `--json`
+##   Output results in JSON format.
+##
+## `--db <path>`
+##   Path to a generated database. Defaults to `$XDG_CACHE_HOME/spam/files.db`.
+##
+## `--verbose`
+##   Print progress to stderr.
+##
+## Option Search
+## =============
+##
+## ```
+##
+##   spam opt --module-options options.json <query>
+##   spam opt --db options.db <query>
+## ```
+##
+## `--module-options` reads an `options.json` file produced by
+## `nixosOptionsDoc`. `--db` reads a generated options database.
+##
+## Package Search
+## ==============
+##
+## ```
+##
+##   spam pkg --db files.db <query>
+## ```
+##
+## `spam pkg` searches a package-manifest database from `spam db build` or an
+## autonomous index from `spam index`. Matches are substring matches against
+## store-output-relative paths, so `bin/foo` matches `/bin/foo`.
+##
+## Database Generation
+## ===================
+##
+## ```
+##
+##   spam db build --manifest packages.json --output files.db
+##   spam db build --manifest options.json --output options.db
+## ```
+##
+## Package manifests describe already-realized store outputs. Store hashes are
+## not recorded; paths are stored relative to each output and deduplicated
+## across packages. If the manifest is an `options.json` produced by
+## `nixosOptionsDoc`, `spam` builds an option database instead.
+##
+## Supported package manifest shapes include an array of package objects, an
+## object mapping attr names to store paths, and an object mapping attr names to
+## named output paths.
+##
+## ```
+##
+##   {
+##     "hello": "/nix/store/...-hello-2.12",
+##     "git": {
+##       "out": "/nix/store/...-git-2.51.0",
+##       "man": "/nix/store/...-git-2.51.0-man"
+##     }
+##   }
+## ```
+##
+## Autonomous Indexing
+## ===================
+##
+## ```
+##
+##   spam index --output files.db --nixpkgs PATH --cache-url URL
+##              --system SYSTEM --scope ATTR --concurrent N
+##              --no-follow-refs --verbose
+## ```
+##
+## `spam index` enumerates packages from nixpkgs via
+## `nix-env -qaP --xml --out-path`, then fetches file listings from a Nix binary
+## cache using BFS reference traversal. It produces an autonomous index database
+## usable with `spam pkg`.
+##
+## Index options:
+##
+## `--output <files.db>`
+##   Database output path. Defaults to the `--db` path.
+##
+## `--nixpkgs <path>`
+##   Nixpkgs path or expression for `nix-env -f`. Defaults to `<nixpkgs>`.
+##
+## `--cache-url <url>`
+##   Binary cache URL. Defaults to `https://cache.nixos.org`.
+##
+## `--system <system>`
+##   Override the target system, for example `x86_64-linux`.
+##
+## `--scope <attr>`
+##   Limit indexing to a single attr set, for example `python3Packages`.
+##
+## `--concurrent <n>`
+##   Maximum parallel HTTP requests.
+##
+## `--no-follow-refs`
+##   Only index direct package outputs and skip transitive store-reference
+##   traversal.
+##
+## Bugs
+## ====
+##
+## Report issues at https://github.com/feel-co/spam/issues.
+
 import std/[algorithm, asyncdispatch, hashes, json, os, parseopt, sequtils,
     sets, strformat, strutils, tables]
 import filemeta
@@ -825,8 +959,8 @@ proc matchingPackages(records: seq[FileEntry], query: string): seq[FileEntry] =
       result.add(record)
 
 proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
-  matchingPackages(parsePackages(indexedBucketLines(path, path.packageSearchKind,
-      query.queryBucket)), query)
+  matchingPackages(parsePackages(indexedBucketLines(path,
+      path.packageSearchKind, query.queryBucket)), query)
 
 proc printPackages(records: seq[FileEntry], jsonOutput: bool) =
   if jsonOutput:

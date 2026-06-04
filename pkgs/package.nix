@@ -1,6 +1,7 @@
 {
   lib,
   buildNimPackage,
+  jq,
   openssl,
   pandoc,
   zstd,
@@ -10,7 +11,7 @@
 let
   testOpt = callPackage ../test/opt.nix { };
 in
-buildNimPackage (finalAttrs: rec {
+buildNimPackage (finalAttrs: {
   pname = "spam";
   version = "0.0.1";
 
@@ -22,12 +23,6 @@ buildNimPackage (finalAttrs: rec {
     fs.toSource {
       root = s;
       fileset = fs.unions [
-        (fs.fileFilter (
-          file:
-          builtins.any file.hasExt [
-            "md"
-          ]
-        ) (s + /doc))
         (fs.fileFilter (
           file:
           builtins.any file.hasExt [
@@ -43,11 +38,12 @@ buildNimPackage (finalAttrs: rec {
       ];
     };
 
+  nimFlags = [ "-d:ssl" ];
+
   nativeBuildInputs = [
+    jq
     pandoc
   ];
-
-  nimFlags = [ "-d:ssl" ];
 
   buildInputs = [
     openssl
@@ -56,11 +52,23 @@ buildNimPackage (finalAttrs: rec {
   ];
 
   postBuild = ''
-    pandoc -s -o ${finalAttrs.pname}.1 doc/${pname}.man1.md
+    nim jsondoc -d:ssl --outdir:jsondocs src/spam.nim
+    jq -r '.moduleDescription' jsondocs/spam.json > ${finalAttrs.pname}.1.html
+    pandoc \
+      -s \
+      -f html \
+      -t man \
+      --metadata title=${lib.escapeShellArg finalAttrs.pname} \
+      --metadata section=1 \
+      -o ${finalAttrs.pname}.1 \
+      ${finalAttrs.pname}.1.html
+    nim doc -d:ssl --outdir:htmldocs src/spam.nim
   '';
 
   postInstall = ''
     install -Dm644 ${finalAttrs.pname}.1 -t "$out/share/man/man1/"
+    mkdir -p "$out/share/doc/${finalAttrs.pname}"
+    cp -R htmldocs/. "$out/share/doc/${finalAttrs.pname}/"
   '';
 
   doInstallCheck = true;
