@@ -10,7 +10,7 @@ substring queries against them.
 
 ```toml
 [dependencies]
-spam-db = "0.1.0"
+spam-db = "0.2"
 ```
 
 ### Query an options database
@@ -54,8 +54,8 @@ match SpamDb::open("unknown.db")? {
 A spam database is a binary file with three sections:
 
 ```plaintext
-# spam-db-v1\t{options|packages}\n
-[256 x 8-byte index entries: (offset: u32le, length: u32le)]
+# spam-db-v2\t{options|packages}\n
+[256 x 16-byte index entries: (offset: u64le, length: u64le)]
 [concatenated zstd-compressed bucket blobs]
 ```
 
