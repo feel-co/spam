@@ -46,6 +46,7 @@ use spam_db::SpamDb;
 match SpamDb::open("unknown.db")? {
     SpamDb::Options(db) => { /* ... */ }
     SpamDb::Packages(db) => { /* ... */ }
+    SpamDb::Index(db) => { /* ... */ }
 }
 ```
 
@@ -54,7 +55,7 @@ match SpamDb::open("unknown.db")? {
 A spam database is a binary file with three sections:
 
 ```plaintext
-# spam-db-v2\t{options|packages}\n
+# spam-db-v2\t{options|packages|index}\n
 [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 [concatenated zstd-compressed bucket blobs]
 ```
@@ -62,6 +63,11 @@ A spam database is a binary file with three sections:
 Each line in the database is placed in every bucket corresponding to a unique
 byte in its search key. Queries decompress only the bucket for `query[0]`,
 keeping lookup sublinear in the total database size.
+
+The `packages` kind is produced by `spam db build` from local package manifests.
+The `index` kind is produced by `spam index` from nixpkgs and binary-cache file
+listings. `PackagesDb` can query both kinds, but consumers can distinguish them
+with `SpamDb::kind()`.
 
 ## Building spam databases
 

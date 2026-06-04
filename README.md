@@ -39,7 +39,8 @@ $ spam opt --db options.db networking.firewall
 
 ### `pkg` - package file search
 
-Search a package-file database for which package(s) ship a given file.
+Search a package-file database or autonomous index for which package(s) ship a
+given file.
 
 ```bash
 # Find which package ships libfoo.so
@@ -73,8 +74,9 @@ Manifest formats accepted:
 
 SPAM databases are zstd-compressed text files with a 256-bucket binary index.
 Each line is keyed by every unique byte in its search key, providing sublinear
-lookup for any query. The magic header `# spam-db-v2` identifies the file kind
-(options or packages).
+lookup for any query. The magic header `# spam-db-v2` identifies the file kind:
+`options` for option databases, `packages` for package-manifest databases from
+`spam db build`, or `index` for autonomous indexes from `spam index`.
 
 ## Building
 

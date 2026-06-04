@@ -45,8 +45,9 @@ Path to the JSON options file from `nixosOptionsDoc`.
 
 `spam pkg --db [files.db] [SEARCH STRING]`
 
-Searches a generated package file database. Matches are substring matches against
-store-output-relative paths, so `bin/foo` matches `/bin/foo`.
+Searches a package-manifest database from `spam db build` or an autonomous index
+from `spam index`. Matches are substring matches against store-output-relative
+paths, so `bin/foo` matches `/bin/foo`.
 
 # DATABASE GENERATION
 
@@ -97,7 +98,8 @@ Supported manifest shapes:
 
 Enumerates packages from nixpkgs via `nix-env -qaP --xml --out-path`, then
 fetches file listings from a Nix binary cache (default: https://cache.nixos.org)
-using BFS reference traversal. Produces a spam database usable with `spam pkg`.
+using BFS reference traversal. Produces an autonomous index database usable with
+`spam pkg`.
 
 Equivalent to `nix-index`, but uses spam's bucket-indexed zstd-compressed
 database for faster queries.
