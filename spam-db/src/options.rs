@@ -16,7 +16,7 @@ pub struct OptionRecord {
 
 /// Handle to an open spam options database.
 ///
-/// The file is fully loaded into memory on construction.
+/// Only the fixed-size bucket index is loaded into memory on construction.
 #[derive(Debug)]
 pub struct OptionsDb {
   db: DbFile,

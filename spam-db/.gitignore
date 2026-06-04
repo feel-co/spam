@@ -4,5 +4,6 @@
 
 !/src
 !/tests
+!/benches
 !/Cargo.toml
 !/Cargo.lock

@@ -12,8 +12,8 @@
 //! ## File format
 //!
 //! ```text
-//! # spam-db-v1\t{options|packages}\n
-//! [256 x 8-byte index entries: (offset: u32le, length: u32le)]
+//! # spam-db-v2\t{options|packages}\n
+//! [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 //! [concatenated zstd-compressed bucket blobs]
 //! ```
 //!

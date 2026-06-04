@@ -6,7 +6,7 @@ use std::{collections::HashSet, io::Write};
 /// tab-separated records that will be placed into the appropriate buckets.
 fn build_db(kind: &str, lines: &[&str]) -> Vec<u8> {
   const BUCKETS: usize = 256;
-  const ENTRY_SIZE: usize = 8;
+  const ENTRY_SIZE: usize = 16;
 
   let mut buckets: Vec<Vec<String>> = vec![Vec::new(); BUCKETS];
 
@@ -24,22 +24,22 @@ fn build_db(kind: &str, lines: &[&str]) -> Vec<u8> {
   let mut data: Vec<u8> = Vec::new();
 
   for (i, bucket) in buckets.iter().enumerate() {
-    let offset = data.len() as u32;
-    let length: u32;
+    let offset = data.len() as u64;
+    let length: u64;
     if bucket.is_empty() {
       length = 0;
     } else {
       let text = format!("{}\n", bucket.join("\n"));
       let compressed = zstd::encode_all(text.as_bytes(), 3).unwrap();
-      length = compressed.len() as u32;
+      length = compressed.len() as u64;
       data.extend_from_slice(&compressed);
     }
     let base = i * ENTRY_SIZE;
-    index[base..base + 4].copy_from_slice(&offset.to_le_bytes());
-    index[base + 4..base + 8].copy_from_slice(&length.to_le_bytes());
+    index[base..base + 8].copy_from_slice(&offset.to_le_bytes());
+    index[base + 8..base + 16].copy_from_slice(&length.to_le_bytes());
   }
 
-  let header = format!("# spam-db-v1\t{kind}\n");
+  let header = format!("# spam-db-v2\t{kind}\n");
   let mut out = Vec::new();
   out.write_all(header.as_bytes()).unwrap();
   out.write_all(&index).unwrap();

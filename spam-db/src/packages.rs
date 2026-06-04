@@ -44,7 +44,7 @@ pub struct FileRecord {
 
 /// Handle to an open spam packages database.
 ///
-/// The file is fully loaded into memory on construction.
+/// Only the fixed-size bucket index is loaded into memory on construction.
 #[derive(Debug)]
 pub struct PackagesDb {
   db: DbFile,
