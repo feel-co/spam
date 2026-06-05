@@ -4,8 +4,11 @@
 
 !/doc
 !/src
-!/tests
+!/tests/
+/tests/*
+!/tests/*.nim
 !/spam.nimble
 
 # Ignore build artifact. Source filters are confusing.
-spam
+/spam
+/src/spam
