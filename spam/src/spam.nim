@@ -673,10 +673,16 @@ proc closePartitionFiles(spool: var PackageEntrySpool) =
     spool.partitionFiles[i].close()
   spool.partitionFilesOpen = false
 
-proc sharedPrefixLen(a, b: string): int =
+proc isUtf8Boundary(s: string, offset: int): bool =
+  offset <= 0 or offset >= s.len or (ord(s[offset]) and 0xc0) != 0x80
+
+proc sharedPrefixLen*(a, b: string): int =
   let maxLen = min(a.len, b.len)
   while result < maxLen and a[result] == b[result]:
     inc result
+  while result > 0 and (not a.isUtf8Boundary(result) or
+      not b.isUtf8Boundary(result)):
+    dec result
 
 proc suffixFrom(path: string, shared: int): string =
   if shared >= path.len: "" else: path[shared .. ^1]
