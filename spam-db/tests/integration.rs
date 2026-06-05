@@ -241,6 +241,22 @@ fn packages_query_index_stream_with_metadata() {
 }
 
 #[test]
+fn packages_query_index_stream_with_unicode_delta_paths() {
+    let bytes = build_index_db(&[
+        "P\tunicode-1.0",
+        "F\tr\t1\t0\t\t0\t/𝔞",
+        "F\tr\t1\t0\t\t1\t𝔟",
+    ]);
+    let f = TempFile::write("spam_test_index_unicode_delta.db", &bytes);
+    let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+    let results = db.query("/𝔟").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, "/𝔟");
+    assert_eq!(results[0].packages, vec!["unicode-1.0"]);
+}
+
+#[test]
 fn packages_query_finds_matching_record() {
     let bytes = build_db(
         "packages",
