@@ -824,6 +824,9 @@ proc compressString(data, tempDir, name: string): string =
       if read != result.len:
         fail("truncated compressed block: " & compressedPath)
 
+proc compressedSection(data, tempDir, name: string): string =
+  compressString(data, tempDir, "index-v1-" & name)
+
 proc appendVarint(dst: var string, value: uint64) =
   dst.add(putVarint(value))
 
@@ -1012,13 +1015,16 @@ proc writeIndexV1Database*(path: string, records: seq[FileEntry]) =
   for id, packageName in uniquePackages:
     packageIds[packageName] = id
 
-  let packagesSection = encodePackageTable(uniquePackages)
+  let packagesPayload = encodePackageTable(uniquePackages)
   var blocks: seq[IndexV1Block]
   let blocksSection = encodeRecordBlocks(records, packageIds, tempDir, blocks)
   let blockTableSection = encodeBlockTable(blocks)
   var trigramEntries: seq[IndexV1TrigramEntry]
-  let postingsSection = encodePostings(records, trigramEntries)
-  let trigramSection = encodeTrigramTable(trigramEntries)
+  let postingsPayload = encodePostings(records, trigramEntries)
+  let trigramPayload = encodeTrigramTable(trigramEntries)
+  let packagesSection = compressedSection(packagesPayload, tempDir, "packages")
+  let trigramSection = compressedSection(trigramPayload, tempDir, "trigrams")
+  let postingsSection = compressedSection(postingsPayload, tempDir, "postings")
 
   const sectionCount = 5
   var fixed = ""
@@ -1421,14 +1427,15 @@ proc matchingIndexV1*(path, query: string): seq[FileEntry] =
     blocksSection = sections.findV1Section(IndexV1SectionBlocks)
     trigramsSection = sections.findV1Section(IndexV1SectionTrigrams)
     postingsSection = sections.findV1Section(IndexV1SectionPostings)
-    packages = parseV1Packages(file.readSectionPayload(path, dataStart,
-      packagesSection), packageCount)
+    packages = parseV1Packages(zstdDecompress(file.readSectionPayload(path,
+      dataStart, packagesSection)), packageCount)
     blocks = parseV1Blocks(file.readSectionPayload(path, dataStart,
       blockTableSection), blockCount,
       recordCount, blocksSection.length)
-    postings = file.readSectionPayload(path, dataStart, postingsSection)
-    trigrams = parseV1Trigrams(file.readSectionPayload(path, dataStart,
-      trigramsSection),
+    postings = zstdDecompress(file.readSectionPayload(path, dataStart,
+      postingsSection))
+    trigrams = parseV1Trigrams(zstdDecompress(file.readSectionPayload(path,
+      dataStart, trigramsSection)),
       trigramCount, postings.len, recordCount)
 
   var trigramIndex = initTable[uint32, IndexV1TrigramEntry]()
