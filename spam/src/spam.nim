@@ -134,6 +134,7 @@
 
 import std/[algorithm, asyncdispatch, hashes, json, os, parseopt, sequtils,
     sets, strformat, strutils, tables]
+from std/unicode import validateUtf8
 import filemeta
 import cache
 import index
@@ -141,7 +142,7 @@ import index
 {.passL: "-lzstd".}
 
 const
-  DbMagic = "# spam-db-v3"
+  DbMagic = "# spam-db-v1"
   DefaultDbName = "spam/files.db"
   IndexBuckets = 256
   IndexEntrySize = 16
@@ -150,6 +151,13 @@ const
   ZstdBufferSize = 128 * 1024
   BucketCompressionLevel = 3
   IndexCompressionLevel = 19
+  IndexV1BlockSize = 64 * 1024
+  IndexV1SectionPackages = 1'u16
+  IndexV1SectionBlockTable = 2'u16
+  IndexV1SectionBlocks = 3'u16
+  IndexV1SectionTrigrams = 4'u16
+  IndexV1SectionPostings = 5'u16
+  IndexV1TrigramSkipped = 1'u8
   ZstdContentSizeUnknown = uint64.high
   ZstdContentSizeError = uint64.high - 1
 
@@ -216,6 +224,32 @@ type
     partitionPaths: array[PackageSpoolPartitions, string]
     partitionFiles: array[PackageSpoolPartitions, File]
     partitionFilesOpen: bool
+
+  IndexV1Block = object
+    firstRecordId: uint64
+    recordCount: uint32
+    compressedOffset: uint64
+    compressedLength: uint32
+    uncompressedLength: uint32
+
+  IndexV1TrigramEntry = object
+    trigram: uint32
+    flags: uint8
+    docFreq: uint32
+    postingsOffset: uint64
+    postingsLength: uint32
+
+  IndexV1Section = object
+    kind: uint16
+    offset: uint64
+    length: uint64
+
+  IndexV1DecodedBlock = object
+    firstRecordId: uint64
+    recordCount: uint32
+    compressedOffset: uint64
+    compressedLength: uint32
+    uncompressedLength: uint32
 
 proc zstdGetFrameContentSize(src: pointer, srcSize: csize_t): uint64 {.
     importc: "ZSTD_getFrameContentSize".}
@@ -453,12 +487,41 @@ proc putUint64(value: uint64): string =
   for shift in countup(0, 56, 8):
     result.add(char((value shr shift) and 0xff'u64))
 
+proc putUint32(value: uint32): string =
+  for shift in countup(0, 24, 8):
+    result.add(char((value shr shift) and 0xff'u32))
+
+proc putUint16(value: uint16): string =
+  for shift in countup(0, 8, 8):
+    result.add(char((value shr shift) and 0xff'u16))
+
+proc putVarint(value: uint64): string =
+  var remaining = value
+  while remaining >= 0x80'u64:
+    result.add(char((remaining and 0x7f'u64) or 0x80'u64))
+    remaining = remaining shr 7
+  result.add(char(remaining))
+
 proc getUint64(data: string, offset: int): uint64 =
   if offset + 8 > data.len:
     fail("truncated database index")
 
   for shift in countup(0, 56, 8):
     result = result or (uint64(data[offset + shift div 8]) shl shift)
+
+proc getUint32(data: string, offset: int): uint32 =
+  if offset + 4 > data.len:
+    fail("truncated database")
+
+  for shift in countup(0, 24, 8):
+    result = result or (uint32(data[offset + shift div 8]) shl shift)
+
+proc getUint16(data: string, offset: int): uint16 =
+  if offset + 2 > data.len:
+    fail("truncated database")
+
+  for shift in countup(0, 8, 8):
+    result = result or (uint16(data[offset + shift div 8]) shl shift)
 
 proc zstdDecompress(input: string): string =
   if input.len == 0:
@@ -687,51 +750,313 @@ proc sharedPrefixLen*(a, b: string): int =
 proc suffixFrom(path: string, shared: int): string =
   if shared >= path.len: "" else: path[shared .. ^1]
 
-proc writeIndexPackage(raw: File, packageName: string,
-    entries: var seq[FileEntry]): int =
-  raw.writeRaw("P\t" & packageName & "\n", "index stream")
-  entries.sort(proc(a, b: FileEntry): int = cmp(a.path, b.path))
-  var
-    previousPath = ""
-    seenPaths = initHashSet[string]()
-  for entry in entries:
-    if entry.path.len == 0 or entry.path == "/" or entry.path in seenPaths:
-      continue
-    seenPaths.incl(entry.path)
-    let shared = sharedPrefixLen(previousPath, entry.path)
-    let execFlag = if entry.executable: "1" else: "0"
-    raw.writeRaw("F\t" & $entry.kind & "\t" & $entry.size & "\t" &
-      execFlag & "\t" & entry.target & "\t" & $shared & "\t" &
-      suffixFrom(entry.path, shared) & "\n", "index stream")
-    previousPath = entry.path
-    inc result
+proc indexRecordKey(entry: FileEntry): string =
+  entry.path & "\t" & $entry.kind & "\t" & $entry.size & "\t" &
+    (if entry.executable: "1" else: "0") & "\t" & entry.target
 
-proc mergeIndexStreamInto(
-  spool: var PackageEntrySpool,
-  raw: File,
-): int =
+proc collectIndexRecords(spool: var PackageEntrySpool): seq[FileEntry] =
   spool.closePartitionFiles()
+  var byRecord = initTable[string, FileEntry]()
 
   for i in 0 ..< PackageSpoolPartitions:
     if getFileSize(spool.partitionPaths[i]) == 0:
       continue
 
-    var entriesByPackage = initTable[string, seq[FileEntry]]()
-
     for line in lines(spool.partitionPaths[i]):
       let entry = decodeEntry(line)
-      if entry.path.len == 0:
+      if entry.path.len == 0 or entry.path == "/":
         continue
-      for packageName in entry.packages:
-        var packageEntry = entry
-        packageEntry.packages = @[packageName]
-        entriesByPackage.mgetOrPut(packageName, @[]).add(packageEntry)
 
-    var packageNames = toSeq(entriesByPackage.keys)
-    packageNames.sort()
-    for packageName in packageNames:
-      var entries = entriesByPackage[packageName]
-      result += writeIndexPackage(raw, packageName, entries)
+      let key = entry.indexRecordKey()
+      var record =
+        if key in byRecord: byRecord[key]
+        else: FileEntry(
+          path: entry.path,
+          size: entry.size,
+          kind: entry.kind,
+          executable: entry.executable,
+          target: entry.target,
+          packages: @[],
+        )
+      for packageName in entry.packages:
+        if packageName.len > 0:
+          record.packages.add(packageName)
+      byRecord[key] = record
+
+  for key in byRecord.keys:
+    var record = byRecord[key]
+    record.packages.sort()
+    var uniquePackages: seq[string]
+    for packageName in record.packages:
+      if uniquePackages.len == 0 or uniquePackages[^1] != packageName:
+        uniquePackages.add(packageName)
+    record.packages = uniquePackages
+    result.add(record)
+
+  result.sort(proc(a, b: FileEntry): int =
+    result = cmp(a.path, b.path)
+    if result == 0: result = cmp($a.kind, $b.kind)
+    if result == 0: result = cmp(a.target, b.target)
+    if result == 0: result = cmp(a.size, b.size)
+  )
+
+proc compressString(data, tempDir, name: string): string =
+  let
+    rawPath = tempDir / (name & ".raw")
+    compressedPath = tempDir / (name & ".zst")
+  block:
+    var raw = open(rawPath, fmWrite)
+    raw.writeRaw(data, name & " raw")
+    raw.close()
+  block:
+    var compressed = open(compressedPath, fmWrite)
+    discard zstdCompressFile(rawPath, compressed, IndexCompressionLevel)
+    compressed.close()
+  block:
+    var compressed = open(compressedPath, fmRead)
+    defer: compressed.close()
+    let length = getFileSize(compressedPath)
+    if length > BiggestInt(int.high):
+      fail("compressed block is too large")
+    result = newString(int(length))
+    if result.len > 0:
+      let read = compressed.readBuffer(addr result[0], result.len)
+      if read != result.len:
+        fail("truncated compressed block: " & compressedPath)
+
+proc appendVarint(dst: var string, value: uint64) =
+  dst.add(putVarint(value))
+
+proc kindCode(kind: FileKind): uint64 =
+  case kind
+  of fkDirectory: 1
+  of fkSymlink: 2
+  of fkRegular: 0
+
+proc uniquePathTrigrams(path: string): seq[uint32] =
+  var seen = initHashSet[uint32]()
+  if path.len < 3:
+    return
+  for i in 0 .. path.len - 3:
+    let trigram =
+      (uint32(ord(path[i])) shl 16) or
+      (uint32(ord(path[i + 1])) shl 8) or
+      uint32(ord(path[i + 2]))
+    if trigram notin seen:
+      seen.incl(trigram)
+      result.add(trigram)
+
+proc encodePackageTable(packageNames: seq[string]): string =
+  result.add(putUint32(uint32(packageNames.len)))
+  var
+    names = ""
+    offsets: seq[uint32]
+  offsets.add(0'u32)
+  for packageName in packageNames:
+    names.add(packageName)
+    offsets.add(uint32(names.len))
+  for offset in offsets:
+    result.add(putUint32(offset))
+  result.add(names)
+
+proc encodeRecordPayload(
+  record: FileEntry,
+  previousPath: var string,
+  packageIds: Table[string, int],
+): string =
+  let shared = sharedPrefixLen(previousPath, record.path)
+  let suffix = suffixFrom(record.path, shared)
+  result.appendVarint(uint64(shared))
+  result.appendVarint(uint64(suffix.len))
+  result.add(suffix)
+  result.appendVarint(uint64(record.packages.len))
+  for packageName in record.packages:
+    result.appendVarint(uint64(packageIds[packageName]))
+  result.appendVarint(record.kind.kindCode())
+  result.appendVarint(record.size)
+  result.appendVarint(if record.executable: 1'u64 else: 0'u64)
+  result.appendVarint(uint64(record.target.len))
+  result.add(record.target)
+  previousPath = record.path
+
+proc flushIndexV1Block(
+  currentRecords: var seq[string],
+  currentSize: var int,
+  firstRecordId: var uint64,
+  compressedOffset: var uint64,
+  previousPath: var string,
+  tempDir: string,
+  blocks: var seq[IndexV1Block],
+  output: var string,
+) =
+  if currentRecords.len == 0:
+    return
+  var raw = putVarint(uint64(currentRecords.len))
+  for recordData in currentRecords:
+    raw.add(recordData)
+  let compressed = compressString(raw, tempDir, "index-v1-block-" & $blocks.len)
+  blocks.add(IndexV1Block(
+    firstRecordId: firstRecordId,
+    recordCount: uint32(currentRecords.len),
+    compressedOffset: compressedOffset,
+    compressedLength: uint32(compressed.len),
+    uncompressedLength: uint32(raw.len),
+  ))
+  output.add(compressed)
+  firstRecordId += uint64(currentRecords.len)
+  compressedOffset += uint64(compressed.len)
+  currentRecords.setLen(0)
+  currentSize = 0
+  previousPath = ""
+
+proc encodeRecordBlocks(
+  records: seq[FileEntry],
+  packageIds: Table[string, int],
+  tempDir: string,
+  blocks: var seq[IndexV1Block],
+): string =
+  var
+    currentRecords: seq[string]
+    currentSize = 0
+    firstRecordId = 0'u64
+    compressedOffset = 0'u64
+    previousPath = ""
+  for record in records:
+    var recordData = encodeRecordPayload(record, previousPath, packageIds)
+    if currentRecords.len > 0 and currentSize + recordData.len > IndexV1BlockSize:
+      flushIndexV1Block(currentRecords, currentSize, firstRecordId,
+        compressedOffset, previousPath, tempDir, blocks, result)
+      recordData = encodeRecordPayload(record, previousPath, packageIds)
+    currentRecords.add(recordData)
+    currentSize += recordData.len
+  flushIndexV1Block(currentRecords, currentSize, firstRecordId,
+    compressedOffset, previousPath, tempDir, blocks, result)
+
+proc encodeBlockTable(blocks: seq[IndexV1Block]): string =
+  result.add(putUint32(uint32(blocks.len)))
+  for recordBlock in blocks:
+    result.add(putUint64(recordBlock.firstRecordId))
+    result.add(putUint32(recordBlock.recordCount))
+    result.add(putUint64(recordBlock.compressedOffset))
+    result.add(putUint32(recordBlock.compressedLength))
+    result.add(putUint32(recordBlock.uncompressedLength))
+
+proc encodePostings(
+  records: seq[FileEntry],
+  trigrams: var seq[IndexV1TrigramEntry],
+): string =
+  var postingsByTrigram = initTable[uint32, seq[uint64]]()
+  for recordId, record in records:
+    for trigram in uniquePathTrigrams(record.path):
+      postingsByTrigram.mgetOrPut(trigram, @[]).add(uint64(recordId))
+
+  let threshold = max(1, records.len div 8)
+  var trigramKeys = toSeq(postingsByTrigram.keys)
+  trigramKeys.sort()
+
+  for trigram in trigramKeys:
+    let postings = postingsByTrigram[trigram]
+    let skipped = postings.len > threshold
+    var entry = IndexV1TrigramEntry(
+      trigram: trigram,
+      flags: if skipped: IndexV1TrigramSkipped else: 0'u8,
+      docFreq: uint32(postings.len),
+      postingsOffset: uint64(result.len),
+      postingsLength: 0'u32,
+    )
+    if not skipped:
+      var previous = 0'u64
+      var first = true
+      for id in postings:
+        result.appendVarint(if first: id else: id - previous)
+        previous = id
+        first = false
+      entry.postingsLength = uint32(uint64(result.len) - entry.postingsOffset)
+    trigrams.add(entry)
+
+proc encodeTrigramTable(trigrams: seq[IndexV1TrigramEntry]): string =
+  result.add(putUint32(uint32(trigrams.len)))
+  for entry in trigrams:
+    result.add(char((entry.trigram shr 16) and 0xff'u32))
+    result.add(char((entry.trigram shr 8) and 0xff'u32))
+    result.add(char(entry.trigram and 0xff'u32))
+    result.add(char(entry.flags))
+    result.add(putUint32(entry.docFreq))
+    result.add(putUint64(entry.postingsOffset))
+    result.add(putUint32(entry.postingsLength))
+
+proc sectionEntry(kind: uint16, offset, length: uint64): string =
+  result.add(putUint16(kind))
+  result.add(putUint16(0'u16))
+  result.add(putUint64(offset))
+  result.add(putUint64(length))
+
+proc writeIndexV1Database*(path: string, records: seq[FileEntry]) =
+  path.ensureParent()
+  let tempDir = makeTempDir()
+  defer:
+    if dirExists(tempDir):
+      removeDir(tempDir)
+
+  var packageNames: seq[string]
+  for record in records:
+    for packageName in record.packages:
+      packageNames.add(packageName)
+  packageNames.sort()
+  var uniquePackages: seq[string]
+  for packageName in packageNames:
+    if uniquePackages.len == 0 or uniquePackages[^1] != packageName:
+      uniquePackages.add(packageName)
+
+  var packageIds = initTable[string, int]()
+  for id, packageName in uniquePackages:
+    packageIds[packageName] = id
+
+  let packagesSection = encodePackageTable(uniquePackages)
+  var blocks: seq[IndexV1Block]
+  let blocksSection = encodeRecordBlocks(records, packageIds, tempDir, blocks)
+  let blockTableSection = encodeBlockTable(blocks)
+  var trigramEntries: seq[IndexV1TrigramEntry]
+  let postingsSection = encodePostings(records, trigramEntries)
+  let trigramSection = encodeTrigramTable(trigramEntries)
+
+  const sectionCount = 5
+  var fixed = ""
+  fixed.add(putUint64(uint64(records.len)))
+  fixed.add(putUint32(uint32(uniquePackages.len)))
+  fixed.add(putUint32(uint32(blocks.len)))
+  fixed.add(putUint32(uint32(trigramEntries.len)))
+  fixed.add(putUint32(0'u32))
+  fixed.add(putUint32(uint32(sectionCount)))
+
+  let sectionTableSize = sectionCount * 20
+  var offset = uint64(fixed.len + sectionTableSize)
+  var sectionTable = ""
+  sectionTable.add(sectionEntry(IndexV1SectionPackages, offset,
+      uint64(packagesSection.len)))
+  offset += uint64(packagesSection.len)
+  sectionTable.add(sectionEntry(IndexV1SectionBlockTable, offset,
+      uint64(blockTableSection.len)))
+  offset += uint64(blockTableSection.len)
+  sectionTable.add(sectionEntry(IndexV1SectionBlocks, offset,
+      uint64(blocksSection.len)))
+  offset += uint64(blocksSection.len)
+  sectionTable.add(sectionEntry(IndexV1SectionTrigrams, offset,
+      uint64(trigramSection.len)))
+  offset += uint64(trigramSection.len)
+  sectionTable.add(sectionEntry(IndexV1SectionPostings, offset,
+      uint64(postingsSection.len)))
+
+  var output = open(path, fmWrite)
+  defer: output.close()
+  output.writeRaw(header(dbIndex) & "\n", "database header")
+  output.writeRaw(fixed, "v1 fixed header")
+  output.writeRaw(sectionTable, "v1 section table")
+  output.writeRaw(packagesSection, "v1 package table")
+  output.writeRaw(blockTableSection, "v1 block table")
+  output.writeRaw(blocksSection, "v1 record blocks")
+  output.writeRaw(trigramSection, "v1 trigram table")
+  output.writeRaw(postingsSection, "v1 postings")
 
 proc readExact(file: File, path: string, length: int): string =
   if length == 0:
@@ -796,68 +1121,372 @@ proc writeIndexedDatabase(path: string, kind: DbKind, lines: seq[string]) =
     builder.addLine(line)
   builder.finish()
 
-proc writeCompressedStreamDatabase(path: string, kind: DbKind, rawPath: string,
-    compressionLevel: cint) =
-  path.ensureParent()
-  var output = open(path, fmWrite)
-  defer: output.close()
-  output.writeRaw(header(kind) & "\n", "database header")
-  discard zstdCompressFile(rawPath, output, compressionLevel)
+proc readVarint(data: string, pos: var int): uint64 =
+  var shift = 0
+  for _ in 0 ..< 10:
+    if pos >= data.len:
+      fail("truncated varint in v1 index")
+    let byte = ord(data[pos])
+    inc pos
+    result = result or (uint64(byte and 0x7f) shl shift)
+    if (byte and 0x80) == 0:
+      return
+    shift += 7
+  fail("malformed varint in v1 index")
 
-proc compressedStreamBody(path: string, kind: DbKind): string =
+proc readBytes(data: string, pos: var int, length: int): string =
+  if length < 0 or pos + length > data.len:
+    fail("truncated byte slice in v1 index")
+  result = data[pos ..< pos + length]
+  pos += length
+
+proc requireUtf8(value, label: string) =
+  if value.validateUtf8() != -1:
+    fail("non-UTF-8 " & label & " in v1 index")
+
+proc readSectionPayload(file: File, path: string, dataStart: int,
+    section: IndexV1Section): string =
+  if section.offset > uint64(int.high) or section.length > uint64(int.high):
+    fail("v1 section is too large")
+  let
+    start = int(section.offset)
+    length = int(section.length)
+  if start > int.high - length:
+    fail("v1 section slice overflow")
+  if dataStart > int.high - start:
+    fail("v1 section file offset overflow")
+  file.setFilePos(dataStart + start)
+  file.readExact(path, length)
+
+proc parseV1Sections(data: string, sectionCount: int,
+    payloadLength: uint64): seq[IndexV1Section] =
+  if sectionCount > (int.high - 28) div 20:
+    fail("v1 section table is too large")
+  let tableEnd = 28 + sectionCount * 20
+  if sectionCount < 0 or tableEnd > data.len:
+    fail("truncated v1 section table")
+
+  for i in 0 ..< sectionCount:
+    let base = 28 + i * 20
+    result.add(IndexV1Section(
+      kind: getUint16(data, base),
+      offset: getUint64(data, base + 4),
+      length: getUint64(data, base + 12),
+    ))
+
+  var ranges: seq[(uint64, uint64)]
+  for section in result:
+    let endOffset = section.offset + section.length
+    if endOffset < section.offset or section.offset < uint64(tableEnd) or
+        endOffset > payloadLength:
+      fail("v1 section slice out of bounds")
+    ranges.add((section.offset, endOffset))
+  ranges.sort(proc(a, b: (uint64, uint64)): int = cmp(a[0], b[0]))
+  for i in 1 ..< ranges.len:
+    if ranges[i - 1][1] > ranges[i][0]:
+      fail("overlapping v1 sections")
+
+proc findV1Section(sections: seq[IndexV1Section],
+    kind: uint16): IndexV1Section =
+  var found = false
+  for section in sections:
+    if section.kind == kind:
+      if found:
+        fail("duplicate v1 section")
+      result = section
+      found = true
+  if not found:
+    fail("missing v1 section")
+
+proc parseV1Packages(data: string, expectedCount: int): seq[string] =
+  if data.len < 4:
+    fail("truncated v1 package table")
+  let count = int(getUint32(data, 0))
+  if count != expectedCount:
+    fail("v1 package count mismatch")
+  let namesStart = 4 + (count + 1) * 4
+  if namesStart > data.len:
+    fail("truncated v1 package offset table")
+  let names = data[namesStart .. ^1]
+  var offsets: seq[int]
+  for i in 0 .. count:
+    offsets.add(int(getUint32(data, 4 + i * 4)))
+  for i in 1 ..< offsets.len:
+    if offsets[i - 1] > offsets[i] or offsets[i] > names.len:
+      fail("invalid v1 package string offset")
+  for i in 0 ..< count:
+    let packageName = names[offsets[i] ..< offsets[i + 1]]
+    packageName.requireUtf8("package string")
+    result.add(packageName)
+
+proc parseV1Blocks(data: string, expectedCount: int,
+    recordCount, blocksLength: uint64): seq[IndexV1DecodedBlock] =
+  if data.len < 4:
+    fail("truncated v1 block table")
+  let count = int(getUint32(data, 0))
+  if count != expectedCount or data.len != 4 + count * 28:
+    fail("v1 block table length mismatch")
+
+  var
+    expectedRecordId = 0'u64
+    expectedOffset = 0'u64
+  for i in 0 ..< count:
+    let base = 4 + i * 28
+    let recordBlock = IndexV1DecodedBlock(
+      firstRecordId: getUint64(data, base),
+      recordCount: getUint32(data, base + 8),
+      compressedOffset: getUint64(data, base + 12),
+      compressedLength: getUint32(data, base + 20),
+      uncompressedLength: getUint32(data, base + 24),
+    )
+    if recordBlock.firstRecordId != expectedRecordId or
+        recordBlock.compressedOffset != expectedOffset:
+      fail("non-contiguous v1 record blocks")
+    if uint64(recordBlock.recordCount) > uint64.high - expectedRecordId or
+        uint64(recordBlock.compressedLength) > uint64.high - expectedOffset:
+      fail("v1 block table overflow")
+    expectedRecordId += uint64(recordBlock.recordCount)
+    expectedOffset += uint64(recordBlock.compressedLength)
+    result.add(recordBlock)
+  if expectedRecordId != recordCount or expectedOffset != blocksLength:
+    fail("v1 record block table does not cover index")
+
+proc parseV1Trigrams(data: string, expectedCount: int, postingsLength: int,
+    recordCount: uint64): seq[IndexV1TrigramEntry] =
+  if data.len < 4:
+    fail("truncated v1 trigram table")
+  let count = int(getUint32(data, 0))
+  if count != expectedCount or data.len != 4 + count * 20:
+    fail("v1 trigram table length mismatch")
+  var previous: uint32
+  for i in 0 ..< count:
+    let base = 4 + i * 20
+    let trigram =
+      (uint32(ord(data[base])) shl 16) or
+      (uint32(ord(data[base + 1])) shl 8) or
+      uint32(ord(data[base + 2]))
+    if i > 0 and previous >= trigram:
+      fail("v1 trigram table is not sorted")
+    previous = trigram
+    let entry = IndexV1TrigramEntry(
+      trigram: trigram,
+      flags: uint8(ord(data[base + 3])),
+      docFreq: getUint32(data, base + 4),
+      postingsOffset: getUint64(data, base + 8),
+      postingsLength: getUint32(data, base + 16),
+    )
+    let postingsEnd = entry.postingsOffset + uint64(entry.postingsLength)
+    if postingsEnd < entry.postingsOffset or postingsEnd > uint64(postingsLength):
+      fail("v1 postings slice out of bounds")
+    if (entry.flags and IndexV1TrigramSkipped) != 0 and entry.postingsLength != 0:
+      fail("skipped v1 trigram has postings")
+    if (entry.flags and IndexV1TrigramSkipped) == 0 and
+        uint64(entry.docFreq) > recordCount:
+      fail("v1 trigram doc frequency too large")
+    result.add(entry)
+
+proc decodeV1Postings(entry: IndexV1TrigramEntry, postings: string,
+    recordCount: uint64): seq[uint64] =
+  let
+    start = int(entry.postingsOffset)
+    stop = start + int(entry.postingsLength)
+  if start < 0 or stop > postings.len:
+    fail("v1 postings slice out of bounds")
+  var
+    pos = start
+    current = 0'u64
+  for i in 0 ..< int(entry.docFreq):
+    let value = readVarint(postings, pos)
+    if i == 0:
+      current = value
+    else:
+      if value > uint64.high - current:
+        fail("v1 posting id overflow")
+      current += value
+    if current >= recordCount:
+      fail("v1 posting id out of bounds")
+    if result.len > 0 and result[^1] >= current:
+      fail("non-monotonic v1 postings")
+    result.add(current)
+  if pos != stop:
+    fail("trailing bytes in v1 postings")
+
+proc uniqueQueryTrigrams(query: string): seq[uint32] =
+  uniquePathTrigrams(query)
+
+proc intersectSorted(a, b: seq[uint64]): seq[uint64] =
+  var
+    i = 0
+    j = 0
+  while i < a.len and j < b.len:
+    if a[i] == b[j]:
+      result.add(a[i])
+      inc i
+      inc j
+    elif a[i] < b[j]:
+      inc i
+    else:
+      inc j
+
+proc decodeV1Block(raw: string, firstRecordId: uint64, expectedCount: uint32,
+    packages: seq[string]): seq[(uint64, FileEntry)] =
+  var
+    pos = 0
+    previousPath = ""
+  let count = readVarint(raw, pos)
+  if count != uint64(expectedCount):
+    fail("v1 record block count mismatch")
+
+  for i in 0 ..< int(count):
+    let
+      shared = int(readVarint(raw, pos))
+      suffixLength = int(readVarint(raw, pos))
+    if shared > previousPath.len or not previousPath.isUtf8Boundary(shared):
+      fail("invalid v1 path prefix boundary")
+    let suffix = readBytes(raw, pos, suffixLength)
+    suffix.requireUtf8("path suffix")
+    let path = previousPath[0 ..< shared] & suffix
+    path.requireUtf8("path string")
+    previousPath = path
+
+    let packageCount = int(readVarint(raw, pos))
+    var recordPackages: seq[string]
+    for _ in 0 ..< packageCount:
+      let packageId = int(readVarint(raw, pos))
+      if packageId < 0 or packageId >= packages.len:
+        fail("invalid v1 package id")
+      recordPackages.add(packages[packageId])
+
+    let kind = case readVarint(raw, pos)
+      of 1: fkDirectory
+      of 2: fkSymlink
+      else: fkRegular
+    let
+      size = readVarint(raw, pos)
+      executable = readVarint(raw, pos) != 0
+      targetLength = int(readVarint(raw, pos))
+      target = readBytes(raw, pos, targetLength)
+    target.requireUtf8("target string")
+    result.add((firstRecordId + uint64(i), FileEntry(
+      path: path,
+      packages: recordPackages,
+      size: size,
+      kind: kind,
+      executable: executable,
+      target: target,
+    )))
+
+  if pos != raw.len:
+    fail("trailing bytes in v1 record block")
+
+proc blockForRecord(blocks: seq[IndexV1DecodedBlock], recordId: uint64): int =
+  for i, recordBlock in blocks:
+    if uint64(recordBlock.recordCount) > uint64.high -
+        recordBlock.firstRecordId:
+      fail("v1 record block id overflow")
+    let endId = recordBlock.firstRecordId + uint64(recordBlock.recordCount)
+    if recordId >= recordBlock.firstRecordId and recordId < endId:
+      return i
+  fail("v1 candidate record id has no block")
+
+proc matchingIndexV1*(path, query: string): seq[FileEntry] =
   var file = open(path, fmRead)
   defer: file.close()
-
   let headerLine = file.readLine()
-  if headerLine != header(kind):
+  if headerLine != header(dbIndex):
     fail("unsupported database format: " & path)
+  let
+    dataStart = int(file.getFilePos())
+    payloadLength = getFileSize(path) - file.getFilePos()
+  if payloadLength > BiggestInt(int.high):
+    fail("v1 index is too large for this platform")
+  let fixed = file.readExact(path, 28)
+  if fixed.len < 28:
+    fail("truncated v1 index header")
 
-  let compressedLength = getFileSize(path) - file.getFilePos()
-  if compressedLength > BiggestInt(int.high):
-    fail("database payload is too large for this platform")
-  zstdDecompress(file.readExact(path, int(compressedLength)))
+  let
+    recordCount = getUint64(fixed, 0)
+    packageCount = int(getUint32(fixed, 8))
+    blockCount = int(getUint32(fixed, 12))
+    trigramCount = int(getUint32(fixed, 16))
+    sectionCount = int(getUint32(fixed, 24))
+  if sectionCount > int.high div 20:
+    fail("v1 section table is too large")
+  let
+    sectionTable = file.readExact(path, sectionCount * 20)
+    sections = parseV1Sections(fixed & sectionTable, sectionCount,
+      uint64(payloadLength))
+    packagesSection = sections.findV1Section(IndexV1SectionPackages)
+    blockTableSection = sections.findV1Section(IndexV1SectionBlockTable)
+    blocksSection = sections.findV1Section(IndexV1SectionBlocks)
+    trigramsSection = sections.findV1Section(IndexV1SectionTrigrams)
+    postingsSection = sections.findV1Section(IndexV1SectionPostings)
+    packages = parseV1Packages(file.readSectionPayload(path, dataStart,
+      packagesSection), packageCount)
+    blocks = parseV1Blocks(file.readSectionPayload(path, dataStart,
+      blockTableSection), blockCount,
+      recordCount, blocksSection.length)
+    postings = file.readSectionPayload(path, dataStart, postingsSection)
+    trigrams = parseV1Trigrams(file.readSectionPayload(path, dataStart,
+      trigramsSection),
+      trigramCount, postings.len, recordCount)
 
-proc decodeIndexStreamEntry(line, packageName: string,
-    previousPath: var string): FileEntry =
-  let parts = line.split('\t')
-  if parts.len < 7 or parts[0] != "F":
-    return
+  var trigramIndex = initTable[uint32, IndexV1TrigramEntry]()
+  for entry in trigrams:
+    trigramIndex[entry.trigram] = entry
+    if (entry.flags and IndexV1TrigramSkipped) == 0:
+      discard decodeV1Postings(entry, postings, recordCount)
 
-  let shared = try: parseInt(parts[5]) except ValueError: -1
-  if shared < 0 or shared > previousPath.len:
-    return
-  let path = previousPath[0 ..< shared] & parts[6]
-  previousPath = path
+  var candidates: seq[uint64]
+  if query.len < 3:
+    for recordId in 0'u64 ..< recordCount:
+      candidates.add(recordId)
+  else:
+    var postingLists: seq[seq[uint64]]
+    for trigram in uniqueQueryTrigrams(query):
+      if trigram notin trigramIndex:
+        return
+      let entry = trigramIndex[trigram]
+      if (entry.flags and IndexV1TrigramSkipped) == 0:
+        postingLists.add(decodeV1Postings(entry, postings, recordCount))
+    if postingLists.len == 0:
+      for recordId in 0'u64 ..< recordCount:
+        candidates.add(recordId)
+    else:
+      postingLists.sort(proc(a, b: seq[uint64]): int = cmp(a.len, b.len))
+      candidates = postingLists[0]
+      for i in 1 ..< postingLists.len:
+        candidates = intersectSorted(candidates, postingLists[i])
+        if candidates.len == 0:
+          return
 
-  let kind = case parts[1]
-    of "d": fkDirectory
-    of "s": fkSymlink
-    else: fkRegular
-
-  FileEntry(
-    path: path,
-    kind: kind,
-    size: try: parseUInt(parts[2]) except ValueError: 0'u64,
-    executable: parts[3] == "1",
-    target: parts[4],
-    packages: @[packageName],
-  )
-
-proc matchingIndexStream(path, query: string): seq[FileEntry] =
-  var
-    packageName = ""
-    previousPath = ""
-
-  for line in compressedStreamBody(path, dbIndex).splitLines():
-    if line.len == 0:
-      continue
-    if line.startsWith("P\t"):
-      packageName = line[2 .. ^1]
-      previousPath = ""
-      continue
-    let entry = decodeIndexStreamEntry(line, packageName, previousPath)
-    if entry.path.len > 0 and query in entry.path:
-      result.add(entry)
+  var byBlock = initTable[int, seq[uint64]]()
+  for recordId in candidates:
+    byBlock.mgetOrPut(blockForRecord(blocks, recordId), @[]).add(recordId)
+  var blockIds = toSeq(byBlock.keys)
+  blockIds.sort()
+  for blockId in blockIds:
+    let recordBlock = blocks[blockId]
+    let
+      start = int(recordBlock.compressedOffset)
+      length = int(recordBlock.compressedLength)
+    if start > int.high - length:
+      fail("v1 compressed block slice overflow")
+    let stop = start + length
+    if start < 0 or stop > int(blocksSection.length):
+      fail("v1 compressed block slice out of bounds")
+    if dataStart > int.high - int(blocksSection.offset) or
+        dataStart + int(blocksSection.offset) > int.high - start:
+      fail("v1 compressed block file offset overflow")
+    file.setFilePos(dataStart + int(blocksSection.offset) + start)
+    let raw = zstdDecompress(file.readExact(path, length))
+    if raw.len != int(recordBlock.uncompressedLength):
+      fail("v1 record block length mismatch")
+    let wanted = byBlock[blockId].toHashSet()
+    for (recordId, entry) in decodeV1Block(raw, recordBlock.firstRecordId,
+        recordBlock.recordCount, packages):
+      if recordId in wanted and query in entry.path:
+        result.add(entry)
 
 proc compact(value: string): string =
   value.splitWhitespace().join(" ")
@@ -1062,7 +1691,7 @@ proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
     matchingPackages(parsePackages(indexedBucketLines(path, kind,
         query.queryBucket)), query)
   of dbIndex:
-    matchingIndexStream(path, query)
+    matchingIndexV1(path, query)
   of dbOptions:
     fail("unsupported package database format: " & path)
 
@@ -1158,24 +1787,17 @@ proc runIndex(config: Config) =
     spool.addEntry(entry)
   )
 
-  let tempDir = makeTempDir()
-  defer:
-    if dirExists(tempDir):
-      removeDir(tempDir)
-  let rawPath = tempDir / "index.raw"
-  var raw = open(rawPath, fmWrite)
-  let entries = spool.mergeIndexStreamInto(raw)
-  raw.close()
-
-  writeCompressedStreamDatabase(outPath, dbIndex, rawPath, IndexCompressionLevel)
+  let records = spool.collectIndexRecords()
+  writeIndexV1Database(outPath, records)
 
   if config.jsonOutput:
-    echo( %* {"kind": "index", "files": entries, "entries": rawEntries,
+    echo( %* {"kind": "index", "format": "v1", "files": records.len,
+        "entries": rawEntries,
         "output": outPath})
   else:
-    stderr.writeLine(&"indexed {entries} file paths ({rawEntries} entries) -> {outPath}")
+    stderr.writeLine(&"indexed {records.len} file paths ({rawEntries} entries) -> {outPath}")
 
-proc main() =
+proc main() {.used.} =
   let config = parseArgs()
   validate(config)
 
