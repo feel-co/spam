@@ -1,23 +1,23 @@
-# SPDX-License-Identifier: MIT
-# Swap setup adapted from nix-community/nix-index-database (MIT)
-name: "auto-index"
+name: Auto-index Nixpkgs
 on:
   workflow_dispatch:
   schedule:
-    # every sunday at 2:51
+    # Every Sunday at 2:51
     - cron: '51 2 * * 0'
 
 jobs:
   index:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 100
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
-        system: ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin']
+        system: ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin'] # tier 1 Nixpkgs targets
     name: Index ${{ matrix.system }}
     steps:
     - uses: actions/checkout@v6
+      with:
+        depth: 1
 
     - name: Swap space report before modification
       shell: bash
@@ -29,6 +29,8 @@ jobs:
         echo
         df -h /mnt .
         echo
+
+    # Swap setup adapted from nix-community/nix-index-database (MIT)
     - name: Set Swap
       shell: bash
       run: |
@@ -39,6 +41,7 @@ jobs:
           sudo chmod 600 $SWAP_FILE
           sudo mkswap $SWAP_FILE
           sudo swapon $SWAP_FILE
+
     - name: Swap space report after modification
       shell: bash
       run: |
@@ -59,7 +62,7 @@ jobs:
 
     - name: Build spam
       run: |
-        nix build .#spam --extra-experimental-features 'nix-command flakes'
+        nix build .#spam -Lv
         echo "$(pwd)/result/bin" >> "$GITHUB_PATH"
 
     - name: Generate spam index
@@ -72,8 +75,8 @@ jobs:
           --verbose
 
     - name: Upload index artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: spam-index-${{ matrix.system }}
         path: ./spam-index-${{ matrix.system }}
-        retention-days: 90
+        retention-days: 45
