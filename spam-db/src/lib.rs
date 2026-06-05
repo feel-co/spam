@@ -14,16 +14,16 @@
 //! ## File format
 //!
 //! ```text
-//! # spam-db-v3\t{options|packages}\n
+//! # spam-db-v1\t{options|packages}\n
 //! [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 //! [concatenated zstd-compressed bucket blobs]
 //!
-//! # spam-db-v3\tindex\n
-//! [one zstd-compressed package stream]
+//! # spam-db-v1\tindex\n
+//! [sectioned package string table, record blocks, trigram dictionary, postings]
 //! ```
 //!
-//! `options` and `packages` are bucket-indexed. `index` is a package-grouped
-//! stream with prefix-delta encoded paths.
+//! `options` and `packages` are bucket-indexed. `index` stores independently
+//! decodable front-coded record blocks plus a byte-trigram inverted index.
 //!
 //! ## Usage
 //!
@@ -57,6 +57,7 @@
 //! ```
 
 mod format;
+mod index;
 
 pub mod error;
 pub mod options;

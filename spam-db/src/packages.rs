@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::{
     Error, Result,
     format::{DbFile, DbKind},
+    index,
 };
 
 /// The type of a file entry in the store.
@@ -72,7 +73,7 @@ impl PackagesDb {
     pub fn query(&self, query: &str) -> Result<Vec<FileRecord>> {
         match self.db.kind {
             DbKind::Packages => self.query_bucketed(query),
-            DbKind::Index => self.query_stream(query),
+            DbKind::Index => index::v1::query(&self.db, query),
             DbKind::Options => Err(Error::InvalidDatabase(
                 "expected a packages or index database".into(),
             )),
@@ -141,60 +142,4 @@ impl PackagesDb {
         Ok(records)
     }
 
-    fn query_stream(&self, query: &str) -> Result<Vec<FileRecord>> {
-        let lines = self.db.stream_lines()?;
-
-        let mut records = Vec::new();
-        let mut package = String::new();
-        let mut previous_path = String::new();
-        for line in &lines {
-            if let Some(package_name) = line.strip_prefix("P\t") {
-                package = package_name.to_owned();
-                previous_path.clear();
-                continue;
-            }
-
-            let Some(record) = parse_stream_record(line, &package, &mut previous_path) else {
-                continue;
-            };
-            if record.path.contains(query) {
-                records.push(record);
-            }
-        }
-        Ok(records)
-    }
-}
-
-fn parse_stream_record(
-    line: &str,
-    package: &str,
-    previous_path: &mut String,
-) -> Option<FileRecord> {
-    let parts: Vec<&str> = line.splitn(7, '\t').collect();
-    if parts.len() < 7 || parts[0] != "F" {
-        return None;
-    }
-
-    let shared = parts[5].parse::<usize>().ok()?;
-    if shared > previous_path.len() {
-        return None;
-    }
-    let path = format!("{}{}", &previous_path[..shared], parts[6]);
-    previous_path.clear();
-    previous_path.push_str(&path);
-
-    let kind = match parts[1] {
-        "d" => FileKind::Directory,
-        "s" => FileKind::Symlink,
-        _ => FileKind::Regular,
-    };
-
-    Some(FileRecord {
-        path,
-        packages: vec![package.to_owned()],
-        size: parts[2].parse().unwrap_or(0),
-        kind,
-        executable: parts[3] == "1",
-        target: parts[4].to_owned(),
-    })
 }

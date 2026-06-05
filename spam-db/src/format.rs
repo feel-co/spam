@@ -1,5 +1,5 @@
 /// The magic prefix that identifies all spam databases.
-pub(crate) const DB_MAGIC: &str = "# spam-db-v3";
+pub(crate) const DB_MAGIC: &str = "# spam-db-v1";
 
 /// Number of index buckets.
 pub(crate) const INDEX_BUCKETS: usize = 256;
@@ -43,8 +43,8 @@ pub enum DbKind {
 pub(crate) struct DbFile {
     pub(crate) kind: DbKind,
     index: Option<[u8; INDEX_SIZE]>,
-    path: PathBuf,
-    data_start: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) data_start: u64,
 }
 
 impl DbFile {
@@ -154,37 +154,9 @@ impl DbFile {
         query.bytes().next().map(|b| b as usize).unwrap_or(0)
     }
 
-    /// Decompress and return all non-empty lines from a stream database.
-    pub(crate) fn stream_lines(&self) -> Result<Vec<String>> {
-        let mut file = std::fs::File::open(&self.path)?;
-        let file_len = file.metadata()?.len();
-        if self.data_start > file_len {
-            return Err(Error::InvalidDatabase(
-                "stream payload starts past end of file".into(),
-            ));
-        }
-
-        let length = usize::try_from(file_len - self.data_start).map_err(|_| {
-            Error::InvalidDatabase("stream payload is too large for this platform".into())
-        })?;
-        let mut compressed = vec![0u8; length];
-        file.seek(SeekFrom::Start(self.data_start))?;
-        file.read_exact(&mut compressed)?;
-
-        let decompressed = zstd::decode_all(compressed.as_slice())
-            .map_err(|e| Error::InvalidDatabase(format!("zstd error: {e}")))?;
-        let text = String::from_utf8(decompressed)
-            .map_err(|_| Error::InvalidDatabase("non-UTF-8 database content".into()))?;
-
-        Ok(text
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect())
-    }
 }
 
-/// Parse the DB kind from the header line, e.g. `"# spam-db-v3\toptions"`.
+/// Parse the DB kind from the header line, e.g. `"# spam-db-v1\toptions"`.
 fn parse_kind(header: &str) -> Result<DbKind> {
     let rest = header
         .strip_prefix(DB_MAGIC)

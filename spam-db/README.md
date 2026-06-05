@@ -55,7 +55,7 @@ match SpamDb::open("unknown.db")? {
 `options` and `packages` databases are bucket-indexed binary files:
 
 ```plaintext
-# spam-db-v3\t{options|packages}\n
+# spam-db-v1\t{options|packages}\n
 [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 [concatenated zstd-compressed bucket blobs]
 ```
@@ -64,15 +64,16 @@ Each line in the database is placed in every bucket corresponding to a unique
 byte in its search key. Queries decompress only the bucket for `query[0]`,
 keeping lookup sublinear in the total database size.
 
-`index` databases are compact package streams:
+`index` databases are autonomous package indexes:
 
 ```plaintext
-# spam-db-v3\tindex\n
-[one zstd-compressed package stream]
+# spam-db-v1\tindex\n
+[sectioned package string table, record blocks, trigram dictionary, postings]
 ```
 
-The stream groups entries by package and prefix-delta encodes sorted paths to
-avoid the path-record duplication used by the bucketed format.
+The index stores package names once, keeps paths in independently decodable
+front-coded record blocks, and uses a compact byte-trigram-to-block index to
+avoid full-index scans for substring queries.
 
 The `packages` kind is produced by `spam db build` from local package manifests.
 The `index` kind is produced by `spam index` from nixpkgs and binary-cache file
