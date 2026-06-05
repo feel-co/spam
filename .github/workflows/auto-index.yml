@@ -17,7 +17,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with:
-        depth: 1
+        fetch-depth: 1
 
     - name: Swap space report before modification
       shell: bash
