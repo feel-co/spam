@@ -14,7 +14,7 @@
 ##   spam db build --manifest packages.json --output files.db
 ##   spam db build --manifest options.json --output options.db
 ##   spam index --output files.db --nixpkgs PATH --cache-url URL
-##              --system SYSTEM --scope ATTR --concurrent N
+##              --system SYSTEM --scope ATTR --attrs ATTRS --concurrent N
 ##              --follow-refs --verbose
 ## ```
 ##
@@ -94,7 +94,7 @@
 ## ```
 ##
 ##   spam index --output files.db --nixpkgs PATH --cache-url URL
-##              --system SYSTEM --scope ATTR --concurrent N
+##              --system SYSTEM --scope ATTR --attrs ATTRS --concurrent N
 ##              --no-follow-refs --verbose
 ## ```
 ##
@@ -119,6 +119,11 @@
 ##
 ## `--scope <attr>`
 ##   Limit indexing to a single attr set, for example `python3Packages`.
+##
+## `--attrs <attrs>`
+##   Limit indexing to a comma-separated list of explicit attr paths, for example
+##   `hello,gitMinimal,ripgrep`. This is intended for bounded benchmarks that must
+##   not enumerate all of nixpkgs.
 ##
 ## `--concurrent <n>`
 ##   Maximum parallel HTTP requests.
@@ -151,7 +156,7 @@ const
   ZstdBufferSize = 128 * 1024
   BucketCompressionLevel = 3
   IndexCompressionLevel = 19
-  IndexV1BlockSize = 64 * 1024
+  IndexV1BlockSize = 128 * 1024
   IndexV1SectionPackages = 1'u16
   IndexV1SectionBlockTable = 2'u16
   IndexV1SectionBlocks = 3'u16
@@ -188,6 +193,7 @@ type
     indexNixpkgs: string
     indexSystem: string
     indexScope: string
+    indexAttrs: seq[string]
     indexCacheUrl: string
     indexConcurrent: int
     indexFollowRefs: bool
@@ -259,6 +265,14 @@ proc zstdDecompress(
   src: pointer,
   compressedSize: csize_t,
 ): csize_t {.importc: "ZSTD_decompress".}
+proc zstdCompressBound(srcSize: csize_t): csize_t {.importc: "ZSTD_compressBound".}
+proc zstdCompress(
+  dst: pointer,
+  dstCapacity: csize_t,
+  src: pointer,
+  srcSize: csize_t,
+  compressionLevel: cint,
+): csize_t {.importc: "ZSTD_compress".}
 proc zstdIsError(code: csize_t): cuint {.importc: "ZSTD_isError".}
 proc zstdGetErrorName(code: csize_t): cstring {.importc: "ZSTD_getErrorName".}
 proc zstdCreateCStream(): pointer {.importc: "ZSTD_createCStream".}
@@ -290,7 +304,8 @@ Usage:
   spam db build --manifest packages.json --output files.db [--json]
   spam db build --manifest options.json --output options.db [--json]
   spam index [--output files.db] [--nixpkgs <path>] [--cache-url <url>]
-             [--system <system>] [--scope <attr>] [--concurrent <n>]
+             [--system <system>] [--scope <attr>] [--attrs <attrs>]
+             [--concurrent <n>]
              [--follow-refs] [--verbose]
   spam --help
 
@@ -323,6 +338,8 @@ index options:
       --cache-url <url>    Binary cache URL. Defaults to https://cache.nixos.org.
       --system <system>    Override the target system (e.g. x86_64-linux).
       --scope <attr>       Limit indexing to a single attr set (e.g. python3Packages).
+      --attrs <attrs>      Comma-separated attr paths for bounded benchmarks
+                           (e.g. hello,gitMinimal,ripgrep).
       --concurrent <n>     Maximum parallel HTTP requests (default: 32).
       --follow-refs        Also index transitive references from each package.
       --no-follow-refs     Only index direct package outputs, skip transitive
@@ -418,6 +435,11 @@ proc parseArgs(): Config =
         result.indexSystem = requireValue("--system", value)
       of "scope":
         result.indexScope = requireValue("--scope", value)
+      of "attrs":
+        for attr in requireValue("--attrs", value).split(','):
+          let stripped = attr.strip()
+          if stripped.len > 0:
+            result.indexAttrs.add(stripped)
       of "concurrent":
         let n = parseInt(requireValue("--concurrent", value))
         if n < 1 or n > 256:
@@ -468,7 +490,8 @@ proc validate(config: Config) =
       fail("db build requires --output")
     validatePath(config.manifest, "manifest")
   of cmdIndex:
-    discard # all index options have sensible defaults
+    if config.indexScope.len > 0 and config.indexAttrs.len > 0:
+      fail("index accepts either --scope or --attrs, not both")
   of cmdNone:
     discard
 
@@ -801,28 +824,16 @@ proc collectIndexRecords(spool: var PackageEntrySpool): seq[FileEntry] =
   )
 
 proc compressString(data, tempDir, name: string): string =
-  let
-    rawPath = tempDir / (name & ".raw")
-    compressedPath = tempDir / (name & ".zst")
-  block:
-    var raw = open(rawPath, fmWrite)
-    raw.writeRaw(data, name & " raw")
-    raw.close()
-  block:
-    var compressed = open(compressedPath, fmWrite)
-    discard zstdCompressFile(rawPath, compressed, IndexCompressionLevel)
-    compressed.close()
-  block:
-    var compressed = open(compressedPath, fmRead)
-    defer: compressed.close()
-    let length = getFileSize(compressedPath)
-    if length > BiggestInt(int.high):
-      fail("compressed block is too large")
-    result = newString(int(length))
-    if result.len > 0:
-      let read = compressed.readBuffer(addr result[0], result.len)
-      if read != result.len:
-        fail("truncated compressed block: " & compressedPath)
+  if data.len == 0:
+    return ""
+  let bound = zstdCompressBound(csize_t(data.len))
+  if bound > csize_t(int.high):
+    fail("compressed block is too large: " & name)
+  result = newString(int(bound))
+  let written = zstdCompress(addr result[0], bound, unsafeAddr data[0],
+    csize_t(data.len), IndexCompressionLevel)
+  checkedZstd(written, "zstd compression failed")
+  result.setLen(int(written))
 
 proc compressedSection(data, tempDir, name: string): string =
   compressString(data, tempDir, "index-v1-" & name)
@@ -946,14 +957,22 @@ proc encodeBlockTable(blocks: seq[IndexV1Block]): string =
 
 proc encodePostings(
   records: seq[FileEntry],
+  blocks: seq[IndexV1Block],
   trigrams: var seq[IndexV1TrigramEntry],
 ): string =
   var postingsByTrigram = initTable[uint32, seq[uint64]]()
-  for recordId, record in records:
-    for trigram in uniquePathTrigrams(record.path):
-      postingsByTrigram.mgetOrPut(trigram, @[]).add(uint64(recordId))
+  for blockId, recordBlock in blocks:
+    var blockTrigrams = initHashSet[uint32]()
+    let
+      first = int(recordBlock.firstRecordId)
+      last = first + int(recordBlock.recordCount)
+    for record in records[first ..< last]:
+      for trigram in uniquePathTrigrams(record.path):
+        blockTrigrams.incl(trigram)
+    for trigram in blockTrigrams:
+      postingsByTrigram.mgetOrPut(trigram, @[]).add(uint64(blockId))
 
-  let threshold = max(1, records.len div 8)
+  let threshold = max(1, blocks.len div 8)
   var trigramKeys = toSeq(postingsByTrigram.keys)
   trigramKeys.sort()
 
@@ -1020,7 +1039,7 @@ proc writeIndexV1Database*(path: string, records: seq[FileEntry]) =
   let blocksSection = encodeRecordBlocks(records, packageIds, tempDir, blocks)
   let blockTableSection = encodeBlockTable(blocks)
   var trigramEntries: seq[IndexV1TrigramEntry]
-  let postingsPayload = encodePostings(records, trigramEntries)
+  let postingsPayload = encodePostings(records, blocks, trigramEntries)
   let trigramPayload = encodeTrigramTable(trigramEntries)
   let packagesSection = compressedSection(packagesPayload, tempDir, "packages")
   let trigramSection = compressedSection(trigramPayload, tempDir, "trigrams")
@@ -1385,16 +1404,6 @@ proc decodeV1Block(raw: string, firstRecordId: uint64, expectedCount: uint32,
   if pos != raw.len:
     fail("trailing bytes in v1 record block")
 
-proc blockForRecord(blocks: seq[IndexV1DecodedBlock], recordId: uint64): int =
-  for i, recordBlock in blocks:
-    if uint64(recordBlock.recordCount) > uint64.high -
-        recordBlock.firstRecordId:
-      fail("v1 record block id overflow")
-    let endId = recordBlock.firstRecordId + uint64(recordBlock.recordCount)
-    if recordId >= recordBlock.firstRecordId and recordId < endId:
-      return i
-  fail("v1 candidate record id has no block")
-
 proc matchingIndexV1*(path, query: string): seq[FileEntry] =
   var file = open(path, fmRead)
   defer: file.close()
@@ -1436,18 +1445,18 @@ proc matchingIndexV1*(path, query: string): seq[FileEntry] =
       postingsSection))
     trigrams = parseV1Trigrams(zstdDecompress(file.readSectionPayload(path,
       dataStart, trigramsSection)),
-      trigramCount, postings.len, recordCount)
+      trigramCount, postings.len, uint64(blockCount))
 
   var trigramIndex = initTable[uint32, IndexV1TrigramEntry]()
   for entry in trigrams:
     trigramIndex[entry.trigram] = entry
     if (entry.flags and IndexV1TrigramSkipped) == 0:
-      discard decodeV1Postings(entry, postings, recordCount)
+      discard decodeV1Postings(entry, postings, uint64(blockCount))
 
-  var candidates: seq[uint64]
+  var candidateBlocks: seq[uint64]
   if query.len < 3:
-    for recordId in 0'u64 ..< recordCount:
-      candidates.add(recordId)
+    for blockId in 0'u64 ..< uint64(blockCount):
+      candidateBlocks.add(blockId)
   else:
     var postingLists: seq[seq[uint64]]
     for trigram in uniqueQueryTrigrams(query):
@@ -1455,25 +1464,24 @@ proc matchingIndexV1*(path, query: string): seq[FileEntry] =
         return
       let entry = trigramIndex[trigram]
       if (entry.flags and IndexV1TrigramSkipped) == 0:
-        postingLists.add(decodeV1Postings(entry, postings, recordCount))
+        postingLists.add(decodeV1Postings(entry, postings, uint64(blockCount)))
     if postingLists.len == 0:
-      for recordId in 0'u64 ..< recordCount:
-        candidates.add(recordId)
+      for blockId in 0'u64 ..< uint64(blockCount):
+        candidateBlocks.add(blockId)
     else:
       postingLists.sort(proc(a, b: seq[uint64]): int = cmp(a.len, b.len))
-      candidates = postingLists[0]
+      candidateBlocks = postingLists[0]
       for i in 1 ..< postingLists.len:
-        candidates = intersectSorted(candidates, postingLists[i])
-        if candidates.len == 0:
+        candidateBlocks = intersectSorted(candidateBlocks, postingLists[i])
+        if candidateBlocks.len == 0:
           return
 
-  var byBlock = initTable[int, seq[uint64]]()
-  for recordId in candidates:
-    byBlock.mgetOrPut(blockForRecord(blocks, recordId), @[]).add(recordId)
-  var blockIds = toSeq(byBlock.keys)
-  blockIds.sort()
-  for blockId in blockIds:
-    let recordBlock = blocks[blockId]
+  for blockIdValue in candidateBlocks:
+    if blockIdValue > uint64(int.high) or int(blockIdValue) >= blocks.len:
+      fail("v1 candidate block id out of bounds")
+    let
+      blockId = int(blockIdValue)
+      recordBlock = blocks[blockId]
     let
       start = int(recordBlock.compressedOffset)
       length = int(recordBlock.compressedLength)
@@ -1489,10 +1497,9 @@ proc matchingIndexV1*(path, query: string): seq[FileEntry] =
     let raw = zstdDecompress(file.readExact(path, length))
     if raw.len != int(recordBlock.uncompressedLength):
       fail("v1 record block length mismatch")
-    let wanted = byBlock[blockId].toHashSet()
-    for (recordId, entry) in decodeV1Block(raw, recordBlock.firstRecordId,
+    for (_, entry) in decodeV1Block(raw, recordBlock.firstRecordId,
         recordBlock.recordCount, packages):
-      if recordId in wanted and query in entry.path:
+      if query in entry.path:
         result.add(entry)
 
 proc compact(value: string): string =
@@ -1780,6 +1787,7 @@ proc runIndex(config: Config) =
   opts.nixpkgs = config.indexNixpkgs
   opts.system = config.indexSystem
   opts.scope = config.indexScope
+  opts.attrs = config.indexAttrs
   opts.maxConcurrent = config.indexConcurrent
   opts.followRefs = config.indexFollowRefs
   opts.verbose = config.verbose

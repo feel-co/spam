@@ -37,6 +37,8 @@ type
       ## Optional --argstr system override.
     scope*: string
       ## Optional -A scope filter.
+    attrs*: seq[string]
+      ## Optional explicit attr paths to index without enumerating all nixpkgs.
     maxConcurrent*: int
       ## Max parallel HTTP requests. Defaults to MaxConcurrent from cache.nim.
     followRefs*: bool
@@ -57,7 +59,7 @@ proc hashFromPath*(storePath: string): string =
   let dash = base.find('-')
   if dash > 0: base[0 ..< dash] else: base
 
-proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
+proc enumeratePackagesFor(opts: IndexOptions, attr: string): seq[StoreOutput] =
   ## Run nix-env -qaP --out-path --xml and parse the output into StoreOutputs.
   ## Parses the XML stream incrementally without buffering the entire output
   ## (100K+ packages with full store paths would otherwise OOM the process).
@@ -69,8 +71,8 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
   ]
   if opts.system.len > 0:
     args.add(["--argstr", "system", opts.system])
-  if opts.scope.len > 0:
-    args.add(["-A", opts.scope])
+  if attr.len > 0:
+    args.add(["-A", attr])
 
   if opts.verbose:
     stderr.writeLine("spam: running nix-env " & args.join(" "))
@@ -123,8 +125,9 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
                 pname = nameVer[0 ..< i]
                 version = nameVer[i + 1 .. ^1]
                 break
+            let attrName = if currentAttr.len > 0: currentAttr else: attr
             result.add(StoreOutput(
-              attr: currentAttr,
+              attr: attrName,
               pname: pname,
               version: version,
               output: outputName,
@@ -154,6 +157,13 @@ proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
     raise newException(OSError, "nix-env failed:\n" & errOutput)
   if errOutput.len > 0 and opts.verbose:
     stderr.write("spam: nix-env stderr: " & errOutput)
+
+proc enumeratePackages*(opts: IndexOptions): seq[StoreOutput] =
+  if opts.attrs.len == 0:
+    return enumeratePackagesFor(opts, opts.scope)
+
+  for attr in opts.attrs:
+    result.add(enumeratePackagesFor(opts, attr))
 
 proc indexWithCache*(
   outputs: seq[StoreOutput],
@@ -257,6 +267,9 @@ proc indexWithCache*(
         if hash notin retried:
           retried.incl(hash)
           queue.add(hash)
+        else:
+          raise newException(IOError, "failed to index " & hash &
+            " after retry; refusing to write incomplete index: " & e.msg)
 
   if opts.verbose:
     stderr.writeLine("spam: traversal complete. visited=" & $visited.len &

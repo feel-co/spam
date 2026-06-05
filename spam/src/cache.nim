@@ -2,7 +2,7 @@
 ##
 ## Fetches .narinfo and .ls/.ls.xz file listings from a Nix binary cache
 ## (e.g. https://cache.nixos.org) for autonomous database indexing.
-import std/[asyncdispatch, httpclient, json, strutils, math, random]
+import std/[asyncdispatch, httpclient, json, strutils, math, random, os]
 
 {.passL: "-lbrotlidec".}
 
@@ -122,12 +122,80 @@ type
 
   CacheClient* = ref object
     cacheUrl*: string
+    cacheDir*: string
 
 proc newCacheClient*(cacheUrl: string = DefaultCacheUrl): CacheClient =
   ## Create a new cache client for the given binary cache URL.
+  let cacheHome =
+    if getEnv("XDG_CACHE_HOME").len > 0: getEnv("XDG_CACHE_HOME")
+    else: getHomeDir() / ".cache"
   result = CacheClient(
     cacheUrl: cacheUrl.strip(chars = {'/'}),
+    cacheDir: cacheHome / "spam" / "http-cache",
   )
+
+proc fnv1a64(data: string): uint64 =
+  result = 14695981039346656037'u64
+  for ch in data:
+    result = result xor uint64(ord(ch))
+    result = result * 1099511628211'u64
+
+proc hex64(value: uint64): string =
+  const digits = "0123456789abcdef"
+  result = newString(16)
+  for i in countdown(15, 0):
+    result[15 - i] = digits[int((value shr (i * 4)) and 0xf'u64)]
+
+proc cacheBase(c: CacheClient, url: string): string =
+  c.cacheDir / hex64(fnv1a64(url))
+
+proc loadCached(c: CacheClient, url: string): tuple[body, etag,
+    lastModified: string] =
+  let base = c.cacheBase(url)
+  let metaPath = base & ".json"
+  let bodyPath = base & ".body"
+  if not fileExists(metaPath) or not fileExists(bodyPath):
+    return
+  try:
+    let meta = parseFile(metaPath)
+    if meta{"url"}.getStr("") != url:
+      return
+    result.etag = meta{"etag"}.getStr("")
+    result.lastModified = meta{"lastModified"}.getStr("")
+    if result.etag.len == 0 and result.lastModified.len == 0:
+      return
+    result.body = readFile(bodyPath)
+    if not meta.hasKey("bodyLen") or meta{"bodyLen"}.getInt(-1) !=
+        result.body.len:
+      result = ("", "", "")
+      return
+    if not meta.hasKey("bodyHash") or meta{"bodyHash"}.getStr("") != hex64(
+        fnv1a64(result.body)):
+      result = ("", "", "")
+      return
+  except CatchableError:
+    return
+
+proc storeCached(c: CacheClient, url, body, etag, lastModified: string) =
+  if etag.len == 0 and lastModified.len == 0:
+    return
+  createDir(c.cacheDir)
+  let base = c.cacheBase(url)
+  let metaPath = base & ".json"
+  let bodyPath = base & ".body"
+  let tmpMeta = metaPath & ".tmp"
+  let tmpBody = bodyPath & ".tmp"
+  let meta = %* {
+    "url": url,
+    "etag": etag,
+    "lastModified": lastModified,
+    "bodyLen": body.len,
+    "bodyHash": hex64(fnv1a64(body)),
+  }
+  writeFile(tmpBody, body)
+  writeFile(tmpMeta, $meta)
+  moveFile(tmpBody, bodyPath)
+  moveFile(tmpMeta, metaPath)
 
 proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
   ## Fetch `url`, returning body on success or "" on 404.
@@ -135,12 +203,17 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
   ## 5xx retries use a 5 s floor (cache.nixos.org caches server errors for ~5 s).
   ## Non-404 4xx responses raise PermanentHttpError immediately (no retry).
   ## Creates a fresh AsyncHttpClient per attempt to avoid concurrent reuse issues.
+  let cached = c.loadCached(url)
   var delay = BaseDelayMs
   var statusStr = ""
   for attempt in 0 ..< MaxRetries:
     let client = newAsyncHttpClient()
     client.timeout = RequestTimeoutMs
     client.headers = newHttpHeaders()
+    if cached.etag.len > 0:
+      client.headers["If-None-Match"] = cached.etag
+    if cached.lastModified.len > 0:
+      client.headers["If-Modified-Since"] = cached.lastModified
     statusStr = ""
     try:
       let resp = await client.get(url)
@@ -153,8 +226,17 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
         result =
           if encoding == "br": brotliDecompress(raw)
           else: raw
+        c.storeCached(url, result,
+          resp.headers.getOrDefault("etag"),
+          resp.headers.getOrDefault("last-modified"))
         try: client.close() except CatchableError: discard
         return
+      of '3':
+        try: client.close() except CatchableError: discard
+        if statusStr.startsWith("304") and cached.body.len > 0:
+          return cached.body
+        if attempt == MaxRetries - 1:
+          raise newException(HttpRequestError, "HTTP " & statusStr & " for " & url)
       of '4':
         try: client.close() except CatchableError: discard
         if statusStr.startsWith("404"):
@@ -177,7 +259,7 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
 
     # 5xx responses from cache.nixos.org are cached for ~5 seconds, so
     # subsequent retries within that window will hit the same cached error.
-    let isServerError = statusStr.len > 0 and statusStr[0] notin {'2', '4'}
+    let isServerError = statusStr.len > 0 and statusStr[0] notin {'2', '3', '4'}
     let waitMs =
       if isServerError:
         max(delay + rand(delay div 4), ServerErrorFloorMs)
@@ -264,11 +346,8 @@ proc fetchFileListing*(c: CacheClient, hash: string): Future[seq[
     let bodyXz = await c.fetchWithRetry(urlXz)
     if bodyXz.len == 0:
       return @[]
-    # xz decompression requires liblzma FFI which is not yet implemented.
-    # Warn so the user knows file entries are missing for this hash.
-    stderr.writeLine("spam: warning: .ls.xz listing available for " & hash &
-      " but xz decompression is not implemented; file entries skipped")
-    return @[]
+    raise newException(IOError, ".ls.xz listing available for " & hash &
+      " but xz decompression is not implemented; refusing to build incomplete index")
 
   try:
     let root = parseJson(body)
