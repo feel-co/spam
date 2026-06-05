@@ -72,11 +72,10 @@ Manifest formats accepted:
 
 ## Database format
 
-SPAM databases are zstd-compressed text files with a 256-bucket binary index.
-Each line is keyed by every unique byte in its search key, providing sublinear
-lookup for any query. The magic header `# spam-db-v2` identifies the file kind:
-`options` for option databases, `packages` for package-manifest databases from
-`spam db build`, or `index` for autonomous indexes from `spam index`.
+SPAM databases use the `# spam-db-v3` magic header. `options` and `packages`
+databases are zstd-compressed text buckets with a 256-bucket binary index.
+Autonomous `index` databases from `spam index` are compact zstd package streams
+with prefix-delta encoded paths to avoid bucket duplication.
 
 ## Building
 
