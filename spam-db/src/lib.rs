@@ -1,8 +1,8 @@
 //! Parser and query library for [spam](https://github.com/feel-co/spam) databases.
 //!
-//! spam indexes Nix package closures and `nixosOptionsDoc` output into
-//! compressed, bucket-indexed databases. Use this crate to open those
-//! databases and run substring queries against them.
+//! spam indexes Nix package closures and `nixosOptionsDoc` output into compact
+//! compressed databases. Use this crate to open those databases and run
+//! substring queries against them.
 //!
 //! ## Database kinds
 //!
@@ -14,13 +14,16 @@
 //! ## File format
 //!
 //! ```text
-//! # spam-db-v2\t{options|packages|index}\n
+//! # spam-db-v3\t{options|packages}\n
 //! [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 //! [concatenated zstd-compressed bucket blobs]
+//!
+//! # spam-db-v3\tindex\n
+//! [one zstd-compressed package stream]
 //! ```
 //!
-//! Each line is placed in every bucket for each unique byte in its search key.
-//! Queries decompress only the bucket for `query[0]`.
+//! `options` and `packages` are bucket-indexed. `index` is a package-grouped
+//! stream with prefix-delta encoded paths.
 //!
 //! ## Usage
 //!
@@ -71,31 +74,31 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// compile time.
 #[derive(Debug)]
 pub enum SpamDb {
-  /// An options database (NixOS module options).
-  Options(OptionsDb),
-  /// A package-manifest database from `spam db build`.
-  Packages(PackagesDb),
-  /// An autonomous package index from `spam index`.
-  Index(PackagesDb),
+    /// An options database (NixOS module options).
+    Options(OptionsDb),
+    /// A package-manifest database from `spam db build`.
+    Packages(PackagesDb),
+    /// An autonomous package index from `spam index`.
+    Index(PackagesDb),
 }
 
 impl SpamDb {
-  /// Open a spam database, detecting the kind from the file header.
-  pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-    let db = format::DbFile::open(path)?;
-    match db.kind {
-      DbKind::Options => Ok(SpamDb::Options(OptionsDb::from_file(db))),
-      DbKind::Packages => Ok(SpamDb::Packages(PackagesDb::from_file(db))),
-      DbKind::Index => Ok(SpamDb::Index(PackagesDb::from_file(db))),
+    /// Open a spam database, detecting the kind from the file header.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let db = format::DbFile::open(path)?;
+        match db.kind {
+            DbKind::Options => Ok(SpamDb::Options(OptionsDb::from_file(db))),
+            DbKind::Packages => Ok(SpamDb::Packages(PackagesDb::from_file(db))),
+            DbKind::Index => Ok(SpamDb::Index(PackagesDb::from_file(db))),
+        }
     }
-  }
 
-  /// The kind of this database.
-  pub fn kind(&self) -> DbKind {
-    match self {
-      SpamDb::Options(_) => DbKind::Options,
-      SpamDb::Packages(_) => DbKind::Packages,
-      SpamDb::Index(_) => DbKind::Index,
+    /// The kind of this database.
+    pub fn kind(&self) -> DbKind {
+        match self {
+            SpamDb::Options(_) => DbKind::Options,
+            SpamDb::Packages(_) => DbKind::Packages,
+            SpamDb::Index(_) => DbKind::Index,
+        }
     }
-  }
 }

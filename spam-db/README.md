@@ -52,10 +52,10 @@ match SpamDb::open("unknown.db")? {
 
 ## Database format
 
-A spam database is a binary file with three sections:
+`options` and `packages` databases are bucket-indexed binary files:
 
 ```plaintext
-# spam-db-v2\t{options|packages|index}\n
+# spam-db-v3\t{options|packages}\n
 [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 [concatenated zstd-compressed bucket blobs]
 ```
@@ -63,6 +63,16 @@ A spam database is a binary file with three sections:
 Each line in the database is placed in every bucket corresponding to a unique
 byte in its search key. Queries decompress only the bucket for `query[0]`,
 keeping lookup sublinear in the total database size.
+
+`index` databases are compact package streams:
+
+```plaintext
+# spam-db-v3\tindex\n
+[one zstd-compressed package stream]
+```
+
+The stream groups entries by package and prefix-delta encodes sorted paths to
+avoid the path-record duplication used by the bucketed format.
 
 The `packages` kind is produced by `spam db build` from local package manifests.
 The `index` kind is produced by `spam index` from nixpkgs and binary-cache file
