@@ -141,13 +141,15 @@ import index
 {.passL: "-lzstd".}
 
 const
-  DbMagic = "# spam-db-v2"
+  DbMagic = "# spam-db-v3"
   DefaultDbName = "spam/files.db"
   IndexBuckets = 256
   IndexEntrySize = 16
   IndexSize = IndexBuckets * IndexEntrySize
   PackageSpoolPartitions = 256
   ZstdBufferSize = 128 * 1024
+  BucketCompressionLevel = 3
+  IndexCompressionLevel = 19
   ZstdContentSizeUnknown = uint64.high
   ZstdContentSizeError = uint64.high - 1
 
@@ -504,14 +506,16 @@ proc checkedZstd(code: csize_t, action: string) =
   if zstdIsError(code) != 0:
     fail(action & ": " & $zstdGetErrorName(code))
 
-proc zstdCompressFile(inputPath: string, output: File): uint64 =
+proc zstdCompressFile(inputPath: string, output: File,
+    compressionLevel: cint = BucketCompressionLevel): uint64 =
   let stream = zstdCreateCStream()
   if stream == nil:
     fail("zstd compression failed: could not create stream")
   defer:
     discard zstdFreeCStream(stream)
 
-  checkedZstd(zstdInitCStream(stream, 3), "zstd compression failed")
+  checkedZstd(zstdInitCStream(stream, compressionLevel),
+    "zstd compression failed")
   checkedZstd(zstdSetPledgedSrcSize(stream, uint64(getFileSize(inputPath))),
     "zstd compression failed")
 
@@ -653,11 +657,12 @@ proc initPackageEntrySpool(): PackageEntrySpool =
     result.partitionFiles[i] = open(result.partitionPaths[i], fmWrite)
   result.partitionFilesOpen = true
 
-proc partitionFor(path: string): int =
-  int(uint(hash(path)) and uint(PackageSpoolPartitions - 1))
+proc partitionFor(value: string): int =
+  int(uint(hash(value)) and uint(PackageSpoolPartitions - 1))
 
 proc addEntry(spool: var PackageEntrySpool, entry: FileEntry) =
-  let partition = partitionFor(entry.path)
+  let packageName = if entry.packages.len > 0: entry.packages[0] else: ""
+  let partition = partitionFor(packageName)
   spool.partitionFiles[partition].writeRaw(encodeEntry(entry), "entry spool")
   spool.partitionFiles[partition].writeRaw("\n", "entry spool")
 
@@ -668,9 +673,36 @@ proc closePartitionFiles(spool: var PackageEntrySpool) =
     spool.partitionFiles[i].close()
   spool.partitionFilesOpen = false
 
-proc mergeInto(
+proc sharedPrefixLen(a, b: string): int =
+  let maxLen = min(a.len, b.len)
+  while result < maxLen and a[result] == b[result]:
+    inc result
+
+proc suffixFrom(path: string, shared: int): string =
+  if shared >= path.len: "" else: path[shared .. ^1]
+
+proc writeIndexPackage(raw: File, packageName: string,
+    entries: var seq[FileEntry]): int =
+  raw.writeRaw("P\t" & packageName & "\n", "index stream")
+  entries.sort(proc(a, b: FileEntry): int = cmp(a.path, b.path))
+  var
+    previousPath = ""
+    seenPaths = initHashSet[string]()
+  for entry in entries:
+    if entry.path.len == 0 or entry.path == "/" or entry.path in seenPaths:
+      continue
+    seenPaths.incl(entry.path)
+    let shared = sharedPrefixLen(previousPath, entry.path)
+    let execFlag = if entry.executable: "1" else: "0"
+    raw.writeRaw("F\t" & $entry.kind & "\t" & $entry.size & "\t" &
+      execFlag & "\t" & entry.target & "\t" & $shared & "\t" &
+      suffixFrom(entry.path, shared) & "\n", "index stream")
+    previousPath = entry.path
+    inc result
+
+proc mergeIndexStreamInto(
   spool: var PackageEntrySpool,
-  builder: var IndexedDatabaseBuilder,
+  raw: File,
 ): int =
   spool.closePartitionFiles()
 
@@ -678,26 +710,22 @@ proc mergeInto(
     if getFileSize(spool.partitionPaths[i]) == 0:
       continue
 
-    var
-      packagesByPath = initTable[string, HashSet[string]]()
-      metadataByPath = initTable[string, FileEntry]()
+    var entriesByPackage = initTable[string, seq[FileEntry]]()
 
     for line in lines(spool.partitionPaths[i]):
       let entry = decodeEntry(line)
       if entry.path.len == 0:
         continue
-      metadataByPath[entry.path] = entry
       for packageName in entry.packages:
-        packagesByPath.mgetOrPut(entry.path, initHashSet[string]()).incl(packageName)
+        var packageEntry = entry
+        packageEntry.packages = @[packageName]
+        entriesByPackage.mgetOrPut(packageName, @[]).add(packageEntry)
 
-    var paths = toSeq(packagesByPath.keys)
-    paths.sort()
-    for path in paths:
-      var entry = metadataByPath[path]
-      entry.packages = toSeq(packagesByPath[path])
-      entry.packages.sort()
-      builder.addLine(encodeEntry(entry))
-      inc result
+    var packageNames = toSeq(entriesByPackage.keys)
+    packageNames.sort()
+    for packageName in packageNames:
+      var entries = entriesByPackage[packageName]
+      result += writeIndexPackage(raw, packageName, entries)
 
 proc readExact(file: File, path: string, length: int): string =
   if length == 0:
@@ -761,6 +789,69 @@ proc writeIndexedDatabase(path: string, kind: DbKind, lines: seq[string]) =
   for line in lines:
     builder.addLine(line)
   builder.finish()
+
+proc writeCompressedStreamDatabase(path: string, kind: DbKind, rawPath: string,
+    compressionLevel: cint) =
+  path.ensureParent()
+  var output = open(path, fmWrite)
+  defer: output.close()
+  output.writeRaw(header(kind) & "\n", "database header")
+  discard zstdCompressFile(rawPath, output, compressionLevel)
+
+proc compressedStreamBody(path: string, kind: DbKind): string =
+  var file = open(path, fmRead)
+  defer: file.close()
+
+  let headerLine = file.readLine()
+  if headerLine != header(kind):
+    fail("unsupported database format: " & path)
+
+  let compressedLength = getFileSize(path) - file.getFilePos()
+  if compressedLength > BiggestInt(int.high):
+    fail("database payload is too large for this platform")
+  zstdDecompress(file.readExact(path, int(compressedLength)))
+
+proc decodeIndexStreamEntry(line, packageName: string,
+    previousPath: var string): FileEntry =
+  let parts = line.split('\t')
+  if parts.len < 7 or parts[0] != "F":
+    return
+
+  let shared = try: parseInt(parts[5]) except ValueError: -1
+  if shared < 0 or shared > previousPath.len:
+    return
+  let path = previousPath[0 ..< shared] & parts[6]
+  previousPath = path
+
+  let kind = case parts[1]
+    of "d": fkDirectory
+    of "s": fkSymlink
+    else: fkRegular
+
+  FileEntry(
+    path: path,
+    kind: kind,
+    size: try: parseUInt(parts[2]) except ValueError: 0'u64,
+    executable: parts[3] == "1",
+    target: parts[4],
+    packages: @[packageName],
+  )
+
+proc matchingIndexStream(path, query: string): seq[FileEntry] =
+  var
+    packageName = ""
+    previousPath = ""
+
+  for line in compressedStreamBody(path, dbIndex).splitLines():
+    if line.len == 0:
+      continue
+    if line.startsWith("P\t"):
+      packageName = line[2 .. ^1]
+      previousPath = ""
+      continue
+    let entry = decodeIndexStreamEntry(line, packageName, previousPath)
+    if entry.path.len > 0 and query in entry.path:
+      result.add(entry)
 
 proc compact(value: string): string =
   value.splitWhitespace().join(" ")
@@ -959,8 +1050,15 @@ proc matchingPackages(records: seq[FileEntry], query: string): seq[FileEntry] =
       result.add(record)
 
 proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
-  matchingPackages(parsePackages(indexedBucketLines(path,
-      path.packageSearchKind, query.queryBucket)), query)
+  let kind = path.packageSearchKind
+  case kind
+  of dbPackages:
+    matchingPackages(parsePackages(indexedBucketLines(path, kind,
+        query.queryBucket)), query)
+  of dbIndex:
+    matchingIndexStream(path, query)
+  of dbOptions:
+    fail("unsupported package database format: " & path)
 
 proc printPackages(records: seq[FileEntry], jsonOutput: bool) =
   if jsonOutput:
@@ -1054,11 +1152,16 @@ proc runIndex(config: Config) =
     spool.addEntry(entry)
   )
 
-  var builder = initIndexedDatabaseBuilder(outPath, dbIndex)
-  defer: builder.cleanup()
-  let entries = spool.mergeInto(builder)
+  let tempDir = makeTempDir()
+  defer:
+    if dirExists(tempDir):
+      removeDir(tempDir)
+  let rawPath = tempDir / "index.raw"
+  var raw = open(rawPath, fmWrite)
+  let entries = spool.mergeIndexStreamInto(raw)
+  raw.close()
 
-  builder.finish()
+  writeCompressedStreamDatabase(outPath, dbIndex, rawPath, IndexCompressionLevel)
 
   if config.jsonOutput:
     echo( %* {"kind": "index", "files": entries, "entries": rawEntries,
