@@ -11,8 +11,11 @@
 ##   spam opt --module-options options.json QUERY
 ##   spam opt --db options.db QUERY
 ##   spam pkg --db files.db QUERY
+##   spam lib --db lib.db QUERY
+##   spam lib --nix ./lib --prefix lib QUERY
 ##   spam db build --manifest packages.json --output files.db
 ##   spam db build --manifest options.json --output options.db
+##   spam db build --lib ./lib --prefix lib --output lib.db
 ##   spam index --output files.db --nixpkgs PATH --cache-url URL
 ##              --system SYSTEM --scope ATTR --attrs ATTRS --concurrent N
 ##              --follow-refs --verbose
@@ -58,6 +61,33 @@
 ## `spam pkg` searches a package-manifest database from `spam db build` or an
 ## autonomous index from `spam index`. Matches are substring matches against
 ## store-output-relative paths, so `bin/foo` matches `/bin/foo`.
+##
+## Library Function Search
+## =======================
+##
+## ```
+##
+##   spam lib --db lib.db <query>
+##   spam lib --nix <path> [--prefix <attr>] <query>
+## ```
+##
+## `spam lib` searches Nix library functions documented with RFC 145
+## `/** … */` doc comments. Comments are parsed by `nixdoc`; locating them and
+## binding each to the attribute it documents is done by a lexical scan, so
+## files that do not evaluate, or do not yet parse completely, still yield
+## results.
+##
+## `--nix` scans a file or directory directly, which is the mode intended for
+## Nix files you are working on. `--db` reads a database built by
+## `spam db build --lib`.
+##
+## Because the scan sees only the binding site, `lib/strings.nix` yields
+## `concatStrings` rather than `lib.strings.concatStrings`. Pass `--prefix` to
+## supply the enclosing attribute path.
+##
+## Doc comments that document no binding, i.e., a file-level comment above
+## `{ lib }:`, or a comment on a lambda parameter is not indexed as there
+## is no attribute name to record them under.
 ##
 ## Database Generation
 ## ===================
@@ -135,7 +165,7 @@
 ## Bugs
 ## ====
 ##
-## Report issues at https://github.com/feel-co/spam/issues.
+## Report issues at <https://github.com/feel-co/spam/issues>.
 
 import std/[algorithm, asyncdispatch, hashes, json, os, parseopt, sequtils,
     sets, strformat, strutils, tables]
@@ -143,8 +173,9 @@ from std/unicode import validateUtf8
 import filemeta
 import cache
 import index
-
-{.passL: "-lzstd".}
+import zstdffi
+import libindex
+import nixdoc
 
 const
   DbMagic = "# spam-db-v1"
@@ -163,12 +194,16 @@ const
   IndexV1SectionTrigrams = 4'u16
   IndexV1SectionPostings = 5'u16
   IndexV1TrigramSkipped = 1'u8
-  ZstdContentSizeUnknown = uint64.high
-  ZstdContentSizeError = uint64.high - 1
+  MinPathsForCoverageCheck = 100
+    ## Below this many store paths the listing-coverage ratio is noise.
+  MinListingCoveragePercent = 10
+    ## For nixpkgs unstable roughly 94% of enumerated store paths have a
+    ## listing in the cache, so anything under this is a spam-side failure,
+    ## not an absent-object one.
 
 type
   Command = enum
-    cmdNone, cmdOpt, cmdPkg, cmdDb, cmdIndex
+    cmdNone, cmdOpt, cmdPkg, cmdDb, cmdIndex, cmdLib
 
   DbCommand = enum
     dbNone, dbBuild
@@ -177,7 +212,7 @@ type
     optSourceNone, optSourceJson, optSourceDb
 
   DbKind = enum
-    dbOptions, dbPackages, dbIndex
+    dbOptions, dbPackages, dbIndex, dbLib
 
   Config = object
     command: Command
@@ -197,25 +232,26 @@ type
     indexCacheUrl: string
     indexConcurrent: int
     indexFollowRefs: bool
+    ## Options for 'spam lib' and 'db build --lib'
+    libSource: string
+    libPrefix: string
     verbose: bool
 
   OptionRecord = object
     name: string
     summary: string
 
+  LibRecord = object
+    ## A documented Nix library function, as stored in a lib database.
+    name: string
+    summary: string
+    typeSig: string
+    location: string
+    deprecated: bool
+
   PackageOutput = object
     name: string
     path: string
-
-  ZstdInBuffer = object
-    src: pointer
-    size: csize_t
-    pos: csize_t
-
-  ZstdOutBuffer = object
-    dst: pointer
-    size: csize_t
-    pos: csize_t
 
   IndexedDatabaseBuilder = object
     path: string
@@ -257,38 +293,6 @@ type
     compressedLength: uint32
     uncompressedLength: uint32
 
-proc zstdGetFrameContentSize(src: pointer, srcSize: csize_t): uint64 {.
-    importc: "ZSTD_getFrameContentSize".}
-proc zstdDecompress(
-  dst: pointer,
-  dstCapacity: csize_t,
-  src: pointer,
-  compressedSize: csize_t,
-): csize_t {.importc: "ZSTD_decompress".}
-proc zstdCompressBound(srcSize: csize_t): csize_t {.importc: "ZSTD_compressBound".}
-proc zstdCompress(
-  dst: pointer,
-  dstCapacity: csize_t,
-  src: pointer,
-  srcSize: csize_t,
-  compressionLevel: cint,
-): csize_t {.importc: "ZSTD_compress".}
-proc zstdIsError(code: csize_t): cuint {.importc: "ZSTD_isError".}
-proc zstdGetErrorName(code: csize_t): cstring {.importc: "ZSTD_getErrorName".}
-proc zstdCreateCStream(): pointer {.importc: "ZSTD_createCStream".}
-proc zstdFreeCStream(stream: pointer): csize_t {.importc: "ZSTD_freeCStream".}
-proc zstdInitCStream(stream: pointer, compressionLevel: cint): csize_t {.
-    importc: "ZSTD_initCStream".}
-proc zstdSetPledgedSrcSize(stream: pointer, pledgedSrcSize: uint64): csize_t {.
-    importc: "ZSTD_CCtx_setPledgedSrcSize".}
-proc zstdCompressStream(
-  stream: pointer,
-  output: ptr ZstdOutBuffer,
-  input: ptr ZstdInBuffer,
-): csize_t {.importc: "ZSTD_compressStream".}
-proc zstdEndStream(stream: pointer, output: ptr ZstdOutBuffer): csize_t {.
-    importc: "ZSTD_endStream".}
-
 proc fail(message: string) {.noreturn.} =
   stderr.writeLine("spam: " & message)
   quit(1)
@@ -301,8 +305,10 @@ Usage:
   spam opt --module-options options.json [--json] <query>
   spam opt --db options.db [--json] <query>
   spam pkg [--db files.db] [--json] <query>
+  spam lib [--db lib.db] [--nix <path>] [--prefix <attr>] [--json] <query>
   spam db build --manifest packages.json --output files.db [--json]
   spam db build --manifest options.json --output options.db [--json]
+  spam db build --lib <path> --output lib.db [--prefix <attr>] [--json]
   spam index [--output files.db] [--nixpkgs <path>] [--cache-url <url>]
              [--system <system>] [--scope <attr>] [--attrs <attrs>]
              [--concurrent <n>]
@@ -312,7 +318,9 @@ Usage:
 Commands:
   opt       Search an options.json produced by nixosOptionsDoc.
   pkg       Search a package-manifest database or autonomous index.
-  db build  Build a package-file or option database from a local manifest JSON.
+  lib       Search documented Nix library functions, either in a prebuilt
+            database or by scanning Nix files directly.
+  db build  Build a package-file, option or library database.
   index     Autonomously index nixpkgs by fetching file listings from the
             binary cache. Produces an index database, separate from databases
             produced by 'spam db build'.
@@ -327,8 +335,18 @@ opt options:
       --module-options <path>  Path to nixosOptionsDoc options.json.
       --db <path>              Path to a generated options database.
 
+lib options:
+      --db <path>      Path to a database built with 'db build --lib'.
+      --nix <path>     Scan this Nix file or directory instead of a database.
+      --prefix <attr>  Attribute path to prepend to discovered names, e.g.
+                       'lib.strings'. A lexical scan sees only the binding
+                       site, so this supplies the enclosing attribute path.
+
 db build options:
       --manifest <path>  JSON package manifest or nixosOptionsDoc options.json.
+      --lib <path>       Nix file or directory to scan for documented
+                         attributes.
+      --prefix <attr>    Attribute path to prepend to discovered names.
       --output <path>    Database output path.
 
 index options:
@@ -381,6 +399,7 @@ proc parseCommand(config: var Config, args: var seq[string], value: string) =
     of "pkg": config.command = cmdPkg
     of "db": config.command = cmdDb
     of "index": config.command = cmdIndex
+    of "lib": config.command = cmdLib
     else: fail("unknown command: " & value)
   elif config.command == cmdDb and args.len == 2:
     case value
@@ -425,6 +444,10 @@ proc parseArgs(): Config =
         result.moduleOptions = requireValue("--module-options", value)
       of "manifest":
         result.manifest = requireValue("--manifest", value)
+      of "nix", "lib":
+        result.libSource = requireValue("--" & key, value)
+      of "prefix":
+        result.libPrefix = requireValue("--prefix", value)
       of "output":
         result.output = requireValue("--output", value)
       of "nixpkgs":
@@ -479,16 +502,29 @@ proc validate(config: Config) =
     if config.query.len == 0:
       fail("pkg requires a search query")
     validatePath(config.database, "database")
+  of cmdLib:
+    if config.query.len == 0:
+      fail("lib requires a search query")
+    if config.libSource.len > 0:
+      if not (fileExists(config.libSource) or dirExists(config.libSource)):
+        fail("nix source does not exist: " & config.libSource)
+    else:
+      validatePath(config.database, "lib database")
   of cmdDb:
     if config.dbCommand == dbNone:
       fail("db requires a subcommand")
     if config.query.len > 0:
       fail("unexpected argument: " & config.query)
-    if config.manifest.len == 0:
-      fail("db build requires --manifest")
+    if config.manifest.len == 0 and config.libSource.len == 0:
+      fail("db build requires --manifest or --lib")
+    if config.manifest.len > 0 and config.libSource.len > 0:
+      fail("db build accepts either --manifest or --lib, not both")
     if config.output.len == 0:
       fail("db build requires --output")
-    validatePath(config.manifest, "manifest")
+    if config.manifest.len > 0:
+      validatePath(config.manifest, "manifest")
+    elif not (fileExists(config.libSource) or dirExists(config.libSource)):
+      fail("nix source does not exist: " & config.libSource)
   of cmdIndex:
     if config.indexScope.len > 0 and config.indexAttrs.len > 0:
       fail("index accepts either --scope or --attrs, not both")
@@ -500,6 +536,7 @@ proc header(kind: DbKind): string =
   of dbOptions: DbMagic & "\toptions"
   of dbPackages: DbMagic & "\tpackages"
   of dbIndex: DbMagic & "\tindex"
+  of dbLib: DbMagic & "\tlib"
 
 proc ensureParent(path: string) =
   let dir = path.parentDir()
@@ -547,26 +584,14 @@ proc getUint16(data: string, offset: int): uint16 =
     result = result or (uint16(data[offset + shift div 8]) shl shift)
 
 proc zstdDecompress(input: string): string =
-  if input.len == 0:
-    return ""
-
-  let contentSize = zstdGetFrameContentSize(unsafeAddr input[0], csize_t(input.len))
-  if contentSize == ZstdContentSizeError:
-    fail("invalid zstd frame in database")
-  if contentSize == ZstdContentSizeUnknown:
-    fail("zstd frame has unknown decompressed size")
-  if contentSize > uint64(int.high):
-    fail("zstd frame is too large")
-
-  result = newString(int(contentSize))
-  if result.len == 0:
-    return
-
-  let decompressedSize = zstdDecompress(addr result[0], csize_t(result.len),
-    unsafeAddr input[0], csize_t(input.len))
-  if zstdIsError(decompressedSize) != 0:
-    fail("zstd decompression failed: " & $zstdGetErrorName(decompressedSize))
-  result.setLen(int(decompressedSize))
+  ## Decompress a section or block of a spam database.
+  ##
+  ## Database frames are written by spam and always carry a content size, so a
+  ## failure here means the file is corrupt; report it and exit.
+  try:
+    decompressFrame(input)
+  except ZstdError as e:
+    fail(e.msg & " in database")
 
 proc searchableKey(line: string): string =
   let tab = line.find('\t')
@@ -824,16 +849,10 @@ proc collectIndexRecords(spool: var PackageEntrySpool): seq[FileEntry] =
   )
 
 proc compressString(data, tempDir, name: string): string =
-  if data.len == 0:
-    return ""
-  let bound = zstdCompressBound(csize_t(data.len))
-  if bound > csize_t(int.high):
-    fail("compressed block is too large: " & name)
-  result = newString(int(bound))
-  let written = zstdCompress(addr result[0], bound, unsafeAddr data[0],
-    csize_t(data.len), IndexCompressionLevel)
-  checkedZstd(written, "zstd compression failed")
-  result.setLen(int(written))
+  try:
+    compressBlock(data, IndexCompressionLevel)
+  except ZstdError as e:
+    fail(e.msg & ": " & name)
 
 proc compressedSection(data, tempDir, name: string): string =
   compressString(data, tempDir, "index-v1-" & name)
@@ -1585,6 +1604,95 @@ proc searchOptionsDb(config: Config) =
   printOptions(loadMatchingOptionsDatabase(config.database, config.query),
     config.jsonOutput)
 
+proc flatten(value: string): string =
+  ## Collapse a field to a single line so it survives the tab-separated record
+  ## format. Doc comments are multi-line Markdown; the stored summary is a
+  ## one-line gloss, not a substitute for reading the comment.
+  value.splitWhitespace().join(" ")
+
+proc toLibRecord(function: LibFunction): LibRecord =
+  LibRecord(
+    name: function.name,
+    summary: function.doc.summary().flatten(),
+    typeSig: function.doc.typeSig.flatten(),
+    location: function.file & ":" & $function.line,
+    deprecated: function.doc.deprecated,
+  )
+
+proc encodeLibRecord(record: LibRecord): string =
+  record.name & "\t" & record.summary & "\t" & record.typeSig & "\t" &
+    record.location & "\t" & (if record.deprecated: "1" else: "0")
+
+proc decodeLibRecord(line: string): LibRecord =
+  let parts = line.split('\t')
+  if parts.len < 5:
+    return LibRecord(name: if parts.len > 0: parts[0] else: "")
+  LibRecord(
+    name: parts[0],
+    summary: parts[1],
+    typeSig: parts[2],
+    location: parts[3],
+    deprecated: parts[4] == "1",
+  )
+
+proc libRecords(source, prefix: string): seq[LibRecord] =
+  var functions = scanNixTree(source, prefix)
+  functions.sort(proc(a, b: LibFunction): int = cmp(a.name, b.name))
+  for function in functions:
+    result.add(function.toLibRecord())
+
+proc writeLibDatabase(path: string, records: seq[LibRecord]) =
+  var lines: seq[string]
+  for record in records:
+    lines.add(encodeLibRecord(record))
+  writeIndexedDatabase(path, dbLib, lines)
+
+proc matchingLib(records: seq[LibRecord], query: string): seq[LibRecord] =
+  for record in records:
+    if query in record.name:
+      result.add(record)
+
+proc loadMatchingLibDatabase(path, query: string): seq[LibRecord] =
+  var records: seq[LibRecord]
+  for line in indexedBucketLines(path, dbLib, query.queryBucket):
+    let record = decodeLibRecord(line)
+    if record.name.len > 0:
+      records.add(record)
+  matchingLib(records, query)
+
+proc printLib(records: seq[LibRecord], jsonOutput: bool) =
+  if jsonOutput:
+    var output = newJArray()
+    for record in records:
+      var item = %* {"name": record.name, "location": record.location}
+      if record.summary.len > 0:
+        item["summary"] = %record.summary
+      if record.typeSig.len > 0:
+        item["type"] = %record.typeSig
+      if record.deprecated:
+        item["deprecated"] = %true
+      output.add(item)
+    echo output.pretty()
+  else:
+    for record in records:
+      var line = record.name
+      if record.typeSig.len > 0:
+        line &= " :: " & record.typeSig
+      if record.deprecated:
+        line &= "  [deprecated]"
+      echo line
+      if record.summary.len > 0:
+        echo "    " & record.summary
+      echo "    " & record.location
+
+proc searchLib(config: Config) =
+  let records =
+    if config.libSource.len > 0:
+      matchingLib(libRecords(config.libSource, config.libPrefix), config.query)
+    else:
+      loadMatchingLibDatabase(config.database, config.query)
+  printLib(records, config.jsonOutput)
+
 proc packageName(attr, pname, version, output: string): string =
   result = if attr.len > 0: attr else: pname
   if version.len > 0 and version notin result:
@@ -1706,7 +1814,7 @@ proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
         query.queryBucket)), query)
   of dbIndex:
     matchingIndexV1(path, query)
-  of dbOptions:
+  of dbOptions, dbLib:
     fail("unsupported package database format: " & path)
 
 proc printPackages(records: seq[FileEntry], jsonOutput: bool) =
@@ -1745,7 +1853,22 @@ proc countOptionShapes(manifest: JsonNode): tuple[options, other: int] =
     else:
       inc result.other
 
+proc buildLibDatabase(config: Config) =
+  let records = libRecords(config.libSource, config.libPrefix)
+  if records.len == 0:
+    fail("no documented Nix attributes found under " & config.libSource)
+  writeLibDatabase(config.output, records)
+  if config.jsonOutput:
+    echo( %* {"kind": "lib", "functions": records.len,
+        "output": config.output})
+  else:
+    stderr.writeLine(&"indexed {records.len} documented attributes")
+
 proc buildDatabase(config: Config) =
+  if config.libSource.len > 0:
+    buildLibDatabase(config)
+    return
+
   let manifest = parseFile(config.manifest)
   let optionShapes = countOptionShapes(manifest)
 
@@ -1798,19 +1921,34 @@ proc runIndex(config: Config) =
   var spool = initPackageEntrySpool()
   defer: spool.cleanup()
 
-  let rawEntries = waitFor buildIndexDatabase(opts, proc(entry: FileEntry) =
+  let stats = waitFor buildIndexDatabase(opts, proc(entry: FileEntry) =
     spool.addEntry(entry)
   )
+
+  # A store path the cache has no listing for is routine; almost every path
+  # lacking one is not. That pattern means spam could not read the listings it
+  # did fetch, and writing the resulting near-empty database as if it were a
+  # real index is worse than failing. Only trip on runs large enough for the
+  # ratio to mean something.
+  if stats.visited >= MinPathsForCoverageCheck and
+      stats.listed * 100 < stats.visited * MinListingCoveragePercent:
+    fail("only " & $stats.listed & " of " & $stats.visited &
+      " store paths yielded a file listing; refusing to write an index that " &
+      "is almost certainly incomplete")
 
   let records = spool.collectIndexRecords()
   writeIndexV1Database(outPath, records)
 
   if config.jsonOutput:
     echo( %* {"kind": "index", "format": "v1", "files": records.len,
-        "entries": rawEntries,
+        "entries": stats.entries,
+        "paths": stats.visited,
+        "listed": stats.listed,
+        "missing": stats.missing,
         "output": outPath})
   else:
-    stderr.writeLine(&"indexed {records.len} file paths ({rawEntries} entries) -> {outPath}")
+    stderr.writeLine(&"indexed {records.len} file paths ({stats.entries} entries) " &
+      &"from {stats.listed}/{stats.visited} store paths -> {outPath}")
 
 proc main() {.used.} =
   let config = parseArgs()
@@ -1828,6 +1966,8 @@ proc main() {.used.} =
   of cmdPkg:
     printPackages(loadMatchingPackagesDatabase(config.database, config.query),
       config.jsonOutput)
+  of cmdLib:
+    searchLib(config)
   of cmdDb:
     buildDatabase(config)
   of cmdIndex:
