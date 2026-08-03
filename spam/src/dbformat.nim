@@ -38,6 +38,7 @@ type
   SectionEncoding* = enum
     encBuckets = 1 ## 256 zstd blobs, bucketed by every distinct byte of the record key.
     encIndexV1 = 2 ## blocked, prefix-delta encoded records with a trigram index.
+    encIndexV2 = 3 ## column-major row groups with a trigram index.
 
   DbSection* = object
     scope*: Scope
