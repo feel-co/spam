@@ -118,13 +118,86 @@ section table      count x { u16 scope, u16 encoding, u64 offset, u64 length }
 payload            sections in table order
 ```
 
-Sections use one of two encodings. `buckets` is 256 zstd blobs indexed by every
-distinct byte of the record key, used for options, library functions and
-manifest-built package sections. `index-v1` is the blocked, prefix-delta encoded
-record format with a trigram index, used for the nixpkgs package section.
+Sections use one of three encodings. `buckets` is 256 zstd blobs indexed by
+every distinct byte of the record key, used for options, library functions and
+manifest-built package sections. `index-v2` is the column-major format described
+below, used for the nixpkgs package section. `index-v1`, the earlier blocked
+row-major format, is still read so existing databases keep working.
 
-Single-kind `# spam-db-v1` databases written by earlier releases are still read,
-as one synthesised section.
+> [!TIP]
+> Single-kind `# spam-db-v1` databases written by earlier releases are still
+> read, as one synthesised section.
+
+### The package index
+
+Package records are grouped into row groups of 65536, and each group stores
+every column in its own zstd frame at level 22:
+
+```text
+fixed header      record, package, group and trigram counts
+section table     count x { u16 kind, u16 0, u64 offset, u64 length }
+package names     newline separated, zstd
+package sets      per set: varint count, delta varint package ids, zstd
+group directory   per group: u64 data offset, u32 first record, u32 count,
+                  then one u32 compressed length per column
+column data       per group, one zstd frame per column, in column order
+trigram table     per trigram: 3 bytes trigram, u8 flags, 5 bytes postings
+                  offset; a list ends where the next one begins
+postings          delta varint group ids, zstd
+```
+
+The row-major predecessor mixed each record's path text, size, flags and package
+ids into one frame, so the compressor never saw a homogeneous stream. Splitting
+the columns fixes that, and three further things follow from it:
+
+- The size column is transposed into byte planes. The high planes of a file size
+  distribution are nearly all zero, so they collapse. Interleaved, sizes were
+  30% of the whole file, the largest column after the path suffixes.
+- Only regular files carry a size and only symlinks a target, so no placeholders
+  are stored for the rest.
+- The set of packages shipping a path is interned once and referenced by id,
+  rather than repeating a list per record.
+
+The layout also makes matching cheaper than a single mixed stream can be. Only
+the three path columns are needed to evaluate a substring query, so the size,
+package and target columns of a group are decompressed solely when that group
+contains a hit.
+
+### Measurements
+
+Against nix-index, encoding its frcode-plus-one-zstd-22 stream format over an
+identical record set drawn from the nixpkgs `.ls` corpus. Bytes per (path,
+package) entry, lower is better:
+
+| packages | entries | nix-index | index-v1 | index-v2  |
+| -------- | ------- | --------- | -------- | --------- |
+| 12000    | 3.26M   | 4.312     | 6.683    | **3.926** |
+| 40000    | 12.57M  | 3.136     | 5.924    | **2.883** |
+
+That is 8.9% and 8.1% under nix-index, while still carrying a trigram index that
+nix-index has no equivalent of.
+
+Over the whole 25.9M-entry corpus, v2 is **40.5% smaller than v1** at the same
+record set, and larger row groups push that further.
+
+The row group size is the one real knob. Bigger groups compress better but cost
+more to read, since a group is the unit a query decodes. On the 40000-package
+set:
+
+| records per group | B/entry | vs nix-index |
+| ----------------- | ------- | ------------ |
+| 65536             | 3.191   | +1.7%        |
+| 262144 (default)  | 2.883   | -8.1%        |
+| 524288            | 2.767   | -11.8%       |
+| 1048576           | 2.682   | -14.5%       |
+
+Read cost, however, moves the other way. Broad(er) query mixes that lands in
+nearly every group runs about a third slower at 262144 than at 65536. Selective
+queries, the normal case, touch few groups and are barely affected. The default
+sits where the format is comfortably under nix-index at every scale measured
+without paying for the last few percent. The group size is a writer-side choice
+only. Each group's size is recorded in the directory, so changing it does not
+change the format or break existing databases.
 
 ## Building
 
