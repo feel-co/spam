@@ -75,7 +75,14 @@ buildNimPackage (finalAttrs: {
 
   doInstallCheck = true;
   installCheckPhase = ''
-    test $($out/bin/spam opt --module-options ${testOpt}/share/doc/nixos/options.json bye) = "bye.a.b.c"
+    options=${testOpt}/share/doc/nixos/options.json
+
+    # Searching the options.json directly, without building a database.
+    test "$($out/bin/spam search --module-options "$options" bye)" = "bye.a.b.c"
+
+    # And the same query through a database, which exercises the container.
+    $out/bin/spam index --options "$options" --output options.db
+    test "$($out/bin/spam search --db options.db --opt bye)" = "bye.a.b.c"
   '';
 
   meta = {

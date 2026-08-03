@@ -1,27 +1,21 @@
-## spam - search Nix package files and module options
+## spam - search Nix packages, module options and library functions
 ##
-## `spam` searches NixOS module options, package-manifest file databases, and
-## autonomous package indexes.
+## `spam` has two verbs. `spam search` queries a database, `spam index` builds
+## one. Both work in terms of the same three scopes: `pkg` for package file
+## paths, `opt` for NixOS module options, and `lib` for documented Nix library
+## functions.
 ##
 ## Usage
 ## =====
 ##
 ## ```
 ##
-##   spam opt --module-options options.json QUERY
-##   spam opt --db options.db QUERY
-##   spam pkg --db files.db QUERY
-##   spam lib --db lib.db QUERY
-##   spam lib --nix ./lib --prefix lib QUERY
-##   spam db build --manifest packages.json --output files.db
-##   spam db build --manifest options.json --output options.db
-##   spam db build --lib ./lib --prefix lib --output lib.db
-##   spam index --output files.db --nixpkgs PATH --cache-url URL
-##              --system SYSTEM --scope ATTR --attrs ATTRS --concurrent N
-##              --follow-refs --verbose
+##   spam search [--scope LIST] [--pkg] [--opt] [--lib] [--db DB] QUERY
+##   spam index --nixpkgs PATH --output DB
+##   spam index --manifest packages.json --output DB
+##   spam index --options options.json --output DB
+##   spam index --nix ./lib --prefix lib --output DB
 ## ```
-##
-## `--json` may be added to search and database build commands.
 ##
 ## Global Options
 ## ==============
@@ -33,79 +27,72 @@
 ##   Output results in JSON format.
 ##
 ## `--db <path>`
-##   Path to a generated database. Defaults to `$XDG_CACHE_HOME/spam/files.db`.
+##   Path to a database. Defaults to `$XDG_CACHE_HOME/spam/spam.db`.
 ##
 ## `--verbose`
 ##   Print progress to stderr.
 ##
-## Option Search
-## =============
+## Search
+## ======
 ##
 ## ```
 ##
-##   spam opt --module-options options.json <query>
-##   spam opt --db options.db <query>
+##   spam search ripgrep
+##   spam search --lib mapAttrs
+##   spam search --scope pkg,opt firewall
+##   spam search --nix ./lib --prefix lib concatStrings
+##   spam search --module-options options.json networking.firewall
 ## ```
 ##
-## `--module-options` reads an `options.json` file produced by
-## `nixosOptionsDoc`. `--db` reads a generated options database.
+## A search with no scope selected covers every scope the database carries.
+## `--scope` takes a comma-separated list or `all`; `--pkg`, `--opt` and `--lib`
+## are shorthand for adding a single scope to it.
 ##
-## Package Search
-## ==============
+## Package matches are substring matches against store-output-relative paths, so
+## `bin/foo` matches `/bin/foo`. Option and library matches are substring
+## matches against the option or attribute name.
 ##
-## ```
+## Two options search a source directly instead of a database, which is the mode
+## intended for files you are working on. Either one implies its own scope.
 ##
-##   spam pkg --db files.db <query>
-## ```
+## `--module-options <path>`
+##   Search an `options.json` produced by `nixosOptionsDoc`.
 ##
-## `spam pkg` searches a package-manifest database from `spam db build` or an
-## autonomous index from `spam index`. Matches are substring matches against
-## store-output-relative paths, so `bin/foo` matches `/bin/foo`.
+## `--nix <path>` (with optional `--prefix <attr>`)
+##   Scan a Nix file or directory for RFC 145 `/** … */` doc comments. Comments
+##   are parsed by `nixdoc`; locating them and binding each to the attribute it
+##   documents is a lexical scan, so files that do not evaluate, or do not yet
+##   parse completely, still yield results. Because the scan sees only the
+##   binding site, `lib/strings.nix` yields `concatStrings` rather than
+##   `lib.strings.concatStrings`; `--prefix` supplies the enclosing attribute
+##   path. Doc comments that document no binding, such as a file-level comment
+##   above `{ lib }:`, are not indexed, as there is no name to record them under.
 ##
-## Library Function Search
-## =======================
+## Indexing
+## ========
 ##
-## ```
-##
-##   spam lib --db lib.db <query>
-##   spam lib --nix <path> [--prefix <attr>] <query>
-## ```
-##
-## `spam lib` searches Nix library functions documented with RFC 145
-## `/** … */` doc comments. Comments are parsed by `nixdoc`; locating them and
-## binding each to the attribute it documents is done by a lexical scan, so
-## files that do not evaluate, or do not yet parse completely, still yield
-## results.
-##
-## `--nix` scans a file or directory directly, which is the mode intended for
-## Nix files you are working on. `--db` reads a database built by
-## `spam db build --lib`.
-##
-## Because the scan sees only the binding site, `lib/strings.nix` yields
-## `concatStrings` rather than `lib.strings.concatStrings`. Pass `--prefix` to
-## supply the enclosing attribute path.
-##
-## Doc comments that document no binding, i.e., a file-level comment above
-## `{ lib }:`, or a comment on a lambda parameter is not indexed as there
-## is no attribute name to record them under.
-##
-## Database Generation
-## ===================
+## `spam index` writes one database. Each source option contributes one scope,
+## and several may be combined into a single file.
 ##
 ## ```
 ##
-##   spam db build --manifest packages.json --output files.db
-##   spam db build --manifest options.json --output options.db
+##   spam index --manifest packages.json --nix ./lib --output all.db
 ## ```
 ##
-## Package manifests describe already-realized store outputs. Store hashes are
-## not recorded; paths are stored relative to each output and deduplicated
-## across packages. If the manifest is an `options.json` produced by
-## `nixosOptionsDoc`, `spam` builds an option database instead.
+## `--nixpkgs <path>`
+##   Index nixpkgs itself. Packages are enumerated with
+##   `nix-env -qaP --xml --out-path` and their file listings fetched from a Nix
+##   binary cache; library functions are scanned from the tree's `lib`
+##   directory; module options are read from a `nixosOptionsDoc` build. All
+##   three scopes are produced unless `--scope` narrows the set. The value is a
+##   path, or a quoted search-path form such as `--nixpkgs '<nixpkgs>'`.
 ##
-## Supported package manifest shapes include an array of package objects, an
-## object mapping attr names to store paths, and an object mapping attr names to
-## named output paths.
+## `--manifest <path>`
+##   Index the file paths of already-realized store outputs described by a JSON
+##   manifest. Store hashes are not recorded; paths are stored relative to each
+##   output and deduplicated across packages. Supported shapes are an array of
+##   package objects, an object mapping attr names to store paths, and an object
+##   mapping attr names to named output paths.
 ##
 ## ```
 ##
@@ -118,28 +105,13 @@
 ##   }
 ## ```
 ##
-## Autonomous Indexing
-## ===================
+## `--options <path>`
+##   Index an `options.json` produced by `nixosOptionsDoc`.
 ##
-## ```
+## `--nix <path>` (with optional `--prefix <attr>`)
+##   Index documented attributes found by scanning a Nix file or directory.
 ##
-##   spam index --output files.db --nixpkgs PATH --cache-url URL
-##              --system SYSTEM --scope ATTR --attrs ATTRS --concurrent N
-##              --no-follow-refs --verbose
-## ```
-##
-## `spam index` enumerates packages from nixpkgs via
-## `nix-env -qaP --xml --out-path`, then fetches file listings from a Nix binary
-## cache using BFS reference traversal. It produces an autonomous index database
-## usable with `spam pkg`.
-##
-## Index options:
-##
-## `--output <files.db>`
-##   Database output path. Defaults to the `--db` path.
-##
-## `--nixpkgs <path>`
-##   Nixpkgs path or expression for `nix-env -f`. Defaults to `<nixpkgs>`.
+## Options that only affect `--nixpkgs`:
 ##
 ## `--cache-url <url>`
 ##   Binary cache URL. Defaults to `https://cache.nixos.org`.
@@ -147,13 +119,13 @@
 ## `--system <system>`
 ##   Override the target system, for example `x86_64-linux`.
 ##
-## `--scope <attr>`
-##   Limit indexing to a single attr set, for example `python3Packages`.
+## `--attr-set <attr>`
+##   Limit package indexing to a single attr set, for example `python3Packages`.
 ##
 ## `--attrs <attrs>`
-##   Limit indexing to a comma-separated list of explicit attr paths, for example
-##   `hello,gitMinimal,ripgrep`. This is intended for bounded benchmarks that must
-##   not enumerate all of nixpkgs.
+##   Limit package indexing to a comma-separated list of explicit attr paths,
+##   for example `hello,gitMinimal,ripgrep`. This is intended for bounded
+##   benchmarks that must not enumerate all of nixpkgs.
 ##
 ## `--concurrent <n>`
 ##   Maximum parallel HTTP requests.
@@ -172,14 +144,15 @@ import std/[algorithm, asyncdispatch, hashes, json, os, parseopt, sequtils,
 from std/unicode import validateUtf8
 import filemeta
 import cache
+import dbformat
 import index
 import zstdffi
 import libindex
 import nixdoc
+import nixeval
 
 const
-  DbMagic = "# spam-db-v1"
-  DefaultDbName = "spam/files.db"
+  DefaultDbName = "spam/spam.db"
   IndexBuckets = 256
   IndexEntrySize = 16
   IndexSize = IndexBuckets * IndexEntrySize
@@ -203,39 +176,30 @@ const
 
 type
   Command = enum
-    cmdNone, cmdOpt, cmdPkg, cmdDb, cmdIndex, cmdLib
-
-  DbCommand = enum
-    dbNone, dbBuild
-
-  OptSource = enum
-    optSourceNone, optSourceJson, optSourceDb
-
-  DbKind = enum
-    dbOptions, dbPackages, dbIndex, dbLib
+    cmdNone, cmdSearch, cmdIndex
 
   Config = object
     command: Command
-    dbCommand: DbCommand
-    optSource: OptSource
     jsonOutput: bool
-    moduleOptions: string
+    verbose: bool
     database: string
-    manifest: string
     output: string
     query: string
-    ## Options for 'spam index'
+    scopes: ScopeSet
+      ## Scopes named on the command line. Empty means "whatever is there".
+    ## Sources. Each implies its own scope.
+    manifest: string
+    moduleOptions: string
+    libSource: string
+    libPrefix: string
+    ## Options for indexing nixpkgs
     indexNixpkgs: string
     indexSystem: string
-    indexScope: string
+    indexAttrSet: string
     indexAttrs: seq[string]
     indexCacheUrl: string
     indexConcurrent: int
     indexFollowRefs: bool
-    ## Options for 'spam lib' and 'db build --lib'
-    libSource: string
-    libPrefix: string
-    verbose: bool
 
   OptionRecord = object
     name: string
@@ -255,7 +219,6 @@ type
 
   IndexedDatabaseBuilder = object
     path: string
-    kind: DbKind
     tempDir: string
     bucketPaths: array[IndexBuckets, string]
     bucketFiles: array[IndexBuckets, File]
@@ -299,72 +262,73 @@ proc fail(message: string) {.noreturn.} =
 
 proc showHelp() {.noreturn.} =
   stdout.write("""
-spam - search Nix module options and package file indexes
+spam - search Nix packages, module options and library functions
 
 Usage:
-  spam opt --module-options options.json [--json] <query>
-  spam opt --db options.db [--json] <query>
-  spam pkg [--db files.db] [--json] <query>
-  spam lib [--db lib.db] [--nix <path>] [--prefix <attr>] [--json] <query>
-  spam db build --manifest packages.json --output files.db [--json]
-  spam db build --manifest options.json --output options.db [--json]
-  spam db build --lib <path> --output lib.db [--prefix <attr>] [--json]
-  spam index [--output files.db] [--nixpkgs <path>] [--cache-url <url>]
-             [--system <system>] [--scope <attr>] [--attrs <attrs>]
-             [--concurrent <n>]
-             [--follow-refs] [--verbose]
+  spam search [--scope <list>] [--pkg] [--opt] [--lib] [--db <path>]
+              [--module-options <path>] [--nix <path>] [--prefix <attr>]
+              [--json] <query>
+  spam index  [--nixpkgs <path>] [--manifest <path>] [--options <path>]
+              [--nix <path>] [--prefix <attr>] [--scope <list>]
+              [--output <path>] [--json] [--verbose] [index options]
   spam --help
 
 Commands:
-  opt       Search an options.json produced by nixosOptionsDoc.
-  pkg       Search a package-manifest database or autonomous index.
-  lib       Search documented Nix library functions, either in a prebuilt
-            database or by scanning Nix files directly.
-  db build  Build a package-file, option or library database.
-  index     Autonomously index nixpkgs by fetching file listings from the
-            binary cache. Produces an index database, separate from databases
-            produced by 'spam db build'.
+  search    Search a database, or a source given directly on the command line.
+  index     Build a database from nixpkgs, a manifest, an options.json or a
+            Nix tree. Sources may be combined into one database.
+
+Scopes:
+  pkg       Package file paths.
+  opt       NixOS module options.
+  lib       Documented Nix library functions.
 
 Global options:
   -h, --help         Show this help text.
       --json         Emit JSON results.
+      --verbose      Print progress to stderr.
       --db <path>    Database path. Defaults to $XDG_CACHE_HOME/""" &
       DefaultDbName & """.
+      --scope <list> Comma-separated scopes, or 'all'. Searching with no scope
+                     covers every scope the database has; indexing with no
+                     scope produces every scope the sources can supply.
+      --pkg          Shorthand for adding 'pkg' to --scope.
+      --opt          Shorthand for adding 'opt' to --scope.
+      --lib          Shorthand for adding 'lib' to --scope.
 
-opt options:
-      --module-options <path>  Path to nixosOptionsDoc options.json.
-      --db <path>              Path to a generated options database.
+Sources (search reads them live, index writes them into a database):
+      --module-options <path>  An options.json from nixosOptionsDoc. Implies
+                               --opt. Named --options when indexing.
+      --nix <path>             A Nix file or directory to scan for RFC 145
+                               doc comments. Implies --lib.
+      --prefix <attr>          Attribute path to prepend to names discovered by
+                               --nix, e.g. 'lib.strings'. A lexical scan sees
+                               only the binding site, so this supplies the
+                               enclosing attribute path.
 
-lib options:
-      --db <path>      Path to a database built with 'db build --lib'.
-      --nix <path>     Scan this Nix file or directory instead of a database.
-      --prefix <attr>  Attribute path to prepend to discovered names, e.g.
-                       'lib.strings'. A lexical scan sees only the binding
-                       site, so this supplies the enclosing attribute path.
+index sources:
+      --nixpkgs <path>     Index nixpkgs: packages from the binary cache,
+                           library functions from its lib directory, and module
+                           options from nixosOptionsDoc. Accepts a path or a
+                           quoted search-path form, e.g. --nixpkgs '<nixpkgs>'.
+      --manifest <path>    JSON package manifest of realized store outputs.
+                           Implies --pkg.
+      --options <path>     An options.json from nixosOptionsDoc. Implies --opt.
+      --nix <path>         Nix file or directory to scan. Implies --lib.
+      --output <path>      Database output path. Defaults to the --db value.
 
-db build options:
-      --manifest <path>  JSON package manifest or nixosOptionsDoc options.json.
-      --lib <path>       Nix file or directory to scan for documented
-                         attributes.
-      --prefix <attr>    Attribute path to prepend to discovered names.
-      --output <path>    Database output path.
-
-index options:
-      --output <path>      Database output path. Defaults to --db value.
-      --nixpkgs <path>     Nixpkgs path or expression for nix-env -f.
-                           Defaults to <nixpkgs>.
+index options for --nixpkgs:
       --cache-url <url>    Binary cache URL. Defaults to https://cache.nixos.org.
       --system <system>    Override the target system (e.g. x86_64-linux).
-      --scope <attr>       Limit indexing to a single attr set (e.g. python3Packages).
+      --attr-set <attr>    Limit packages to a single attr set (e.g. python3Packages).
       --attrs <attrs>      Comma-separated attr paths for bounded benchmarks
                            (e.g. hello,gitMinimal,ripgrep).
       --concurrent <n>     Maximum parallel HTTP requests (default: 32).
       --follow-refs        Also index transitive references from each package.
       --no-follow-refs     Only index direct package outputs, skip transitive
-                            reference traversal (much faster). Enabled by default.
-      --verbose            Print progress to stderr.
+                           reference traversal (much faster). Enabled by default.
 
-Manifest formats for 'db build':
+Manifest formats:
   [
     {"attr":"hello","pname":"hello","version":"2.12","outputs":{"out":"/nix/store/...-hello-2.12"}}
   ]
@@ -390,40 +354,42 @@ proc rememberQuery(config: var Config, value: string) =
     fail("unexpected argument: " & value)
   config.query = value
 
-proc parseCommand(config: var Config, args: var seq[string], value: string) =
-  args.add(value)
+const RetiredCommands = {
+  "opt": "search --opt",
+  "pkg": "search --pkg",
+  "lib": "search --lib",
+  "db": "index",
+}.toTable
 
-  if config.command == cmdNone:
-    case value
-    of "opt": config.command = cmdOpt
-    of "pkg": config.command = cmdPkg
-    of "db": config.command = cmdDb
-    of "index": config.command = cmdIndex
-    of "lib": config.command = cmdLib
-    else: fail("unknown command: " & value)
-  elif config.command == cmdDb and args.len == 2:
-    case value
-    of "build": config.dbCommand = dbBuild
-    else: fail("unknown db command: " & value)
-  else:
+proc parseCommand(config: var Config, value: string) =
+  if config.command != cmdNone:
     config.rememberQuery(value)
+    return
+
+  case value
+  of "search": config.command = cmdSearch
+  of "index": config.command = cmdIndex
+  else:
+    if value in RetiredCommands:
+      fail("unknown command '" & value & "' (did you mean '" &
+        RetiredCommands[value] & "'?)")
+    fail("unknown command: " & value)
 
 proc parseArgs(): Config =
   result.database = defaultDatabasePath()
   result.indexCacheUrl = DefaultCacheUrl
-  result.indexNixpkgs = "<nixpkgs>"
   result.indexConcurrent = MaxConcurrent
 
   var parser = initOptParser(
     shortNoVal = {'h'},
-    longNoVal = @["help", "json", "verbose", "follow-refs", "no-follow-refs"],
+    longNoVal = @["help", "json", "verbose", "follow-refs", "no-follow-refs",
+      "pkg", "opt", "lib"],
   )
-  var args: seq[string]
 
   for kind, key, value in parser.getopt():
     case kind
     of cmdArgument:
-      result.parseCommand(args, key)
+      result.parseCommand(key)
     of cmdLongOption, cmdShortOption:
       case key
       of "h", "help":
@@ -432,20 +398,22 @@ proc parseArgs(): Config =
         result.jsonOutput = true
       of "verbose":
         result.verbose = true
+      of "pkg":
+        result.scopes.incl(scopePkg)
+      of "opt":
+        result.scopes.incl(scopeOpt)
+      of "lib":
+        result.scopes.incl(scopeLib)
+      of "scope":
+        result.scopes.incl(parseScopes(requireValue("--scope", value)))
       of "db":
-        if result.optSource == optSourceJson:
-          fail("opt accepts either --module-options or --db, not both")
-        result.optSource = optSourceDb
         result.database = requireValue("--db", value)
-      of "module-options":
-        if result.optSource == optSourceDb:
-          fail("opt accepts either --module-options or --db, not both")
-        result.optSource = optSourceJson
-        result.moduleOptions = requireValue("--module-options", value)
+      of "module-options", "options":
+        result.moduleOptions = requireValue("--" & key, value)
       of "manifest":
         result.manifest = requireValue("--manifest", value)
-      of "nix", "lib":
-        result.libSource = requireValue("--" & key, value)
+      of "nix":
+        result.libSource = requireValue("--nix", value)
       of "prefix":
         result.libPrefix = requireValue("--prefix", value)
       of "output":
@@ -456,8 +424,8 @@ proc parseArgs(): Config =
         result.indexCacheUrl = requireValue("--cache-url", value)
       of "system":
         result.indexSystem = requireValue("--system", value)
-      of "scope":
-        result.indexScope = requireValue("--scope", value)
+      of "attr-set":
+        result.indexAttrSet = requireValue("--attr-set", value)
       of "attrs":
         for attr in requireValue("--attrs", value).split(','):
           let stripped = attr.strip()
@@ -484,104 +452,55 @@ proc validatePath(path, label: string) =
   if not fileExists(path):
     fail(label & " does not exist: " & path)
 
+proc validateNixSource(path: string) =
+  if not (fileExists(path) or dirExists(path)):
+    fail("nix source does not exist: " & path)
+
+proc sourceScopes(config: Config): ScopeSet =
+  ## The scopes the command line's source options can supply on their own.
+  if config.moduleOptions.len > 0: result.incl(scopeOpt)
+  if config.libSource.len > 0: result.incl(scopeLib)
+  if config.manifest.len > 0: result.incl(scopePkg)
+  if config.indexNixpkgs.len > 0: result.incl(AllScopes)
+
 proc validate(config: Config) =
   case config.command
-  of cmdOpt:
-    if config.optSource == optSourceNone:
-      fail("opt requires --module-options or --db")
+  of cmdSearch:
     if config.query.len == 0:
-      fail("opt requires a search query")
-    case config.optSource
-    of optSourceJson:
+      fail("search requires a query")
+    if config.manifest.len > 0:
+      fail("--manifest builds a database; use 'spam index --manifest'")
+    if config.moduleOptions.len > 0:
       validatePath(config.moduleOptions, "options file")
-    of optSourceDb:
-      validatePath(config.database, "options database")
-    of optSourceNone:
-      discard
-  of cmdPkg:
-    if config.query.len == 0:
-      fail("pkg requires a search query")
-    validatePath(config.database, "database")
-  of cmdLib:
-    if config.query.len == 0:
-      fail("lib requires a search query")
     if config.libSource.len > 0:
-      if not (fileExists(config.libSource) or dirExists(config.libSource)):
-        fail("nix source does not exist: " & config.libSource)
-    else:
-      validatePath(config.database, "lib database")
-  of cmdDb:
-    if config.dbCommand == dbNone:
-      fail("db requires a subcommand")
+      validateNixSource(config.libSource)
+    let live = config.sourceScopes()
+    # Only the database is consulted for scopes no source covers, so it only
+    # has to exist when at least one such scope remains.
+    if config.scopes - live != {} or live == {}:
+      validatePath(config.database, "database")
+  of cmdIndex:
     if config.query.len > 0:
       fail("unexpected argument: " & config.query)
-    if config.manifest.len == 0 and config.libSource.len == 0:
-      fail("db build requires --manifest or --lib")
-    if config.manifest.len > 0 and config.libSource.len > 0:
-      fail("db build accepts either --manifest or --lib, not both")
-    if config.output.len == 0:
-      fail("db build requires --output")
+    if config.sourceScopes() == {}:
+      fail("index requires --nixpkgs, --manifest, --options or --nix")
+    if config.indexNixpkgs.len > 0 and
+        (config.manifest.len > 0 or config.moduleOptions.len > 0 or
+        config.libSource.len > 0):
+      fail("--nixpkgs already supplies every scope; drop the other sources")
+    if config.indexAttrSet.len > 0 and config.indexAttrs.len > 0:
+      fail("index accepts either --attr-set or --attrs, not both")
+    if config.scopes - config.sourceScopes() != {}:
+      fail("no source supplies scope " &
+        (config.scopes - config.sourceScopes()).describe())
     if config.manifest.len > 0:
       validatePath(config.manifest, "manifest")
-    elif not (fileExists(config.libSource) or dirExists(config.libSource)):
-      fail("nix source does not exist: " & config.libSource)
-  of cmdIndex:
-    if config.indexScope.len > 0 and config.indexAttrs.len > 0:
-      fail("index accepts either --scope or --attrs, not both")
+    if config.moduleOptions.len > 0:
+      validatePath(config.moduleOptions, "options file")
+    if config.libSource.len > 0:
+      validateNixSource(config.libSource)
   of cmdNone:
     discard
-
-proc header(kind: DbKind): string =
-  case kind
-  of dbOptions: DbMagic & "\toptions"
-  of dbPackages: DbMagic & "\tpackages"
-  of dbIndex: DbMagic & "\tindex"
-  of dbLib: DbMagic & "\tlib"
-
-proc ensureParent(path: string) =
-  let dir = path.parentDir()
-  if dir.len > 0:
-    createDir(dir)
-
-proc putUint64(value: uint64): string =
-  for shift in countup(0, 56, 8):
-    result.add(char((value shr shift) and 0xff'u64))
-
-proc putUint32(value: uint32): string =
-  for shift in countup(0, 24, 8):
-    result.add(char((value shr shift) and 0xff'u32))
-
-proc putUint16(value: uint16): string =
-  for shift in countup(0, 8, 8):
-    result.add(char((value shr shift) and 0xff'u16))
-
-proc putVarint(value: uint64): string =
-  var remaining = value
-  while remaining >= 0x80'u64:
-    result.add(char((remaining and 0x7f'u64) or 0x80'u64))
-    remaining = remaining shr 7
-  result.add(char(remaining))
-
-proc getUint64(data: string, offset: int): uint64 =
-  if offset + 8 > data.len:
-    fail("truncated database index")
-
-  for shift in countup(0, 56, 8):
-    result = result or (uint64(data[offset + shift div 8]) shl shift)
-
-proc getUint32(data: string, offset: int): uint32 =
-  if offset + 4 > data.len:
-    fail("truncated database")
-
-  for shift in countup(0, 24, 8):
-    result = result or (uint32(data[offset + shift div 8]) shl shift)
-
-proc getUint16(data: string, offset: int): uint16 =
-  if offset + 2 > data.len:
-    fail("truncated database")
-
-  for shift in countup(0, 8, 8):
-    result = result or (uint16(data[offset + shift div 8]) shl shift)
 
 proc zstdDecompress(input: string): string =
   ## Decompress a section or block of a spam database.
@@ -596,22 +515,6 @@ proc zstdDecompress(input: string): string =
 proc searchableKey(line: string): string =
   let tab = line.find('\t')
   if tab < 0: line else: line[0 ..< tab]
-
-proc writeRaw(file: File, data: string, label: string) =
-  if data.len == 0:
-    return
-
-  let written = file.writeBuffer(unsafeAddr data[0], data.len)
-  if written != data.len:
-    fail("failed to write " & label)
-
-proc writeRaw(file: File, data: pointer, length: int, label: string) =
-  if length == 0:
-    return
-
-  let written = file.writeBuffer(data, length)
-  if written != length:
-    fail("failed to write " & label)
 
 proc checkedZstd(code: csize_t, action: string) =
   if zstdIsError(code) != 0:
@@ -687,20 +590,8 @@ proc cleanup(builder: var IndexedDatabaseBuilder) =
   if builder.tempDir.len > 0 and dirExists(builder.tempDir):
     removeDir(builder.tempDir)
 
-proc makeTempDir(): string =
-  let base = getTempDir() / ("spam-db-" & $getCurrentProcessId())
-  var suffix = 0
-  while true:
-    result = base & "-" & $suffix
-    if not dirExists(result) and not fileExists(result):
-      createDir(result)
-      return
-    inc suffix
-
-proc initIndexedDatabaseBuilder(path: string,
-    kind: DbKind): IndexedDatabaseBuilder =
+proc initIndexedDatabaseBuilder(path: string): IndexedDatabaseBuilder =
   result.path = path
-  result.kind = kind
   result.tempDir = makeTempDir()
   for i in 0 ..< IndexBuckets:
     result.bucketPaths[i] = result.tempDir / $i
@@ -723,14 +614,15 @@ proc closeBucketFiles(builder: var IndexedDatabaseBuilder) =
   builder.bucketFilesOpen = false
 
 proc finish(builder: var IndexedDatabaseBuilder) =
+  ## Write the bucketed section payload: a fixed index table followed by one
+  ## zstd blob per bucket. Offsets are relative to the payload, so the result
+  ## can sit at any position within a database.
   builder.path.ensureParent()
   builder.closeBucketFiles()
 
   var output = open(builder.path, fmWrite)
   defer: output.close()
 
-  let headerLine = header(builder.kind) & "\n"
-  output.writeRaw(headerLine, "database header")
   output.writeRaw(newString(IndexSize), "database index")
 
   var
@@ -745,7 +637,7 @@ proc finish(builder: var IndexedDatabaseBuilder) =
     index.add(putUint64(length))
     offset += length
 
-  output.setFilePos(headerLine.len)
+  output.setFilePos(0)
   output.writeRaw(index, "database index")
   builder.cleanup()
 
@@ -1032,7 +924,8 @@ proc sectionEntry(kind: uint16, offset, length: uint64): string =
   result.add(putUint64(offset))
   result.add(putUint64(length))
 
-proc writeIndexV1Database*(path: string, records: seq[FileEntry]) =
+proc writeIndexV1Payload*(path: string, records: seq[FileEntry]) =
+  ## Write the blocked, trigram-indexed section payload for `records`.
   path.ensureParent()
   let tempDir = makeTempDir()
   defer:
@@ -1093,7 +986,6 @@ proc writeIndexV1Database*(path: string, records: seq[FileEntry]) =
 
   var output = open(path, fmWrite)
   defer: output.close()
-  output.writeRaw(header(dbIndex) & "\n", "database header")
   output.writeRaw(fixed, "v1 fixed header")
   output.writeRaw(sectionTable, "v1 section table")
   output.writeRaw(packagesSection, "v1 package table")
@@ -1102,27 +994,19 @@ proc writeIndexV1Database*(path: string, records: seq[FileEntry]) =
   output.writeRaw(trigramSection, "v1 trigram table")
   output.writeRaw(postingsSection, "v1 postings")
 
-proc readExact(file: File, path: string, length: int): string =
-  if length == 0:
-    return ""
-
-  result = newString(length)
-  let read = file.readBuffer(addr result[0], length)
-  if read != length:
-    fail("truncated database: " & path)
-
-proc indexedBucketLines(path: string, kind: DbKind, bucket: int): seq[string] =
+proc indexedBucketLines(db: Database, section: DbSection,
+    bucket: int): seq[string] =
+  let path = db.path
   var file = open(path, fmRead)
   defer: file.close()
 
-  let headerLine = file.readLine()
-  if headerLine != header(kind):
-    fail("unsupported database format: " & path)
-
   let
-    indexStart = headerLine.len + 1
+    indexStart = db.start(section)
     dataStart = indexStart + IndexSize
-    index = file.readExact(path, IndexSize)
+  if uint64(IndexSize) > section.length:
+    fail("truncated bucket index in " & path)
+  file.setFilePos(indexStart)
+  let index = file.readExact(path, IndexSize)
 
   let entry = bucket * IndexEntrySize
   let
@@ -1145,20 +1029,8 @@ proc indexedBucketLines(path: string, kind: DbKind, bucket: int): seq[string] =
 proc queryBucket(query: string): int =
   if query.len == 0: 0 else: ord(query[0])
 
-proc packageSearchKind(path: string): DbKind =
-  var file = open(path, fmRead)
-  defer: file.close()
-
-  let headerLine = file.readLine()
-  if headerLine == header(dbPackages):
-    dbPackages
-  elif headerLine == header(dbIndex):
-    dbIndex
-  else:
-    fail("unsupported package database format: " & path)
-
-proc writeIndexedDatabase(path: string, kind: DbKind, lines: seq[string]) =
-  var builder = initIndexedDatabaseBuilder(path, kind)
+proc writeBucketedPayload(path: string, lines: seq[string]) =
+  var builder = initIndexedDatabaseBuilder(path)
   defer: builder.cleanup()
 
   for line in lines:
@@ -1423,17 +1295,16 @@ proc decodeV1Block(raw: string, firstRecordId: uint64, expectedCount: uint32,
   if pos != raw.len:
     fail("trailing bytes in v1 record block")
 
-proc matchingIndexV1*(path, query: string): seq[FileEntry] =
+proc matchingIndexV1*(db: Database, section: DbSection,
+    query: string): seq[FileEntry] =
+  let path = db.path
   var file = open(path, fmRead)
   defer: file.close()
-  let headerLine = file.readLine()
-  if headerLine != header(dbIndex):
-    fail("unsupported database format: " & path)
-  let
-    dataStart = int(file.getFilePos())
-    payloadLength = getFileSize(path) - file.getFilePos()
-  if payloadLength > BiggestInt(int.high):
+  let dataStart = db.start(section)
+  if section.length > uint64(int.high):
     fail("v1 index is too large for this platform")
+  let payloadLength = BiggestInt(section.length)
+  file.setFilePos(dataStart)
   let fixed = file.readExact(path, 28)
   if fixed.len < 28:
     fail("truncated v1 index header")
@@ -1560,11 +1431,11 @@ proc optionRecords(options: JsonNode): seq[OptionRecord] =
 
   result.sort(proc(a, b: OptionRecord): int = cmp(a.name, b.name))
 
-proc writeOptionsDatabase(path: string, records: seq[OptionRecord]) =
+proc writeOptionsPayload(path: string, records: seq[OptionRecord]) =
   var lines: seq[string]
   for record in records:
     lines.add(record.name & "\t" & record.summary)
-  writeIndexedDatabase(path, dbOptions, lines)
+  writeBucketedPayload(path, lines)
 
 proc parseOptions(lines: seq[string]): seq[OptionRecord] =
   for line in lines:
@@ -1579,30 +1450,22 @@ proc matchingOptions(records: seq[OptionRecord], query: string): seq[OptionRecor
     if query in record.name:
       result.add(record)
 
-proc loadMatchingOptionsDatabase(path, query: string): seq[OptionRecord] =
-  matchingOptions(parseOptions(indexedBucketLines(path, dbOptions,
+proc loadMatchingOptionsDatabase(db: Database, section: DbSection,
+    query: string): seq[OptionRecord] =
+  matchingOptions(parseOptions(indexedBucketLines(db, section,
       query.queryBucket)), query)
 
-proc printOptions(records: seq[OptionRecord], jsonOutput: bool) =
-  if jsonOutput:
-    var output = newJArray()
-    for record in records:
-      var item = %* {"name": record.name}
-      if record.summary.len > 0:
-        item["summary"] = %record.summary
-      output.add(item)
-    echo output.pretty()
-  else:
-    for record in records:
-      echo record.name
+proc optionsJson(records: seq[OptionRecord]): JsonNode =
+  result = newJArray()
+  for record in records:
+    var item = %* {"name": record.name}
+    if record.summary.len > 0:
+      item["summary"] = %record.summary
+    result.add(item)
 
-proc searchOptionsJson(config: Config) =
-  let records = optionRecords(parseFile(config.moduleOptions))
-  printOptions(matchingOptions(records, config.query), config.jsonOutput)
-
-proc searchOptionsDb(config: Config) =
-  printOptions(loadMatchingOptionsDatabase(config.database, config.query),
-    config.jsonOutput)
+proc printOptions(records: seq[OptionRecord]) =
+  for record in records:
+    echo record.name
 
 proc flatten(value: string): string =
   ## Collapse a field to a single line so it survives the tab-separated record
@@ -1610,11 +1473,27 @@ proc flatten(value: string): string =
   ## one-line gloss, not a substitute for reading the comment.
   value.splitWhitespace().join(" ")
 
+proc stripTypeName(typeSig: string): string =
+  ## Drop the leading `name ::` that a nixpkgs type signature repeats.
+  ##
+  ## The record already carries the name, and often a more qualified one than
+  ## the signature does, so printing both reads as `lib.mapAttrs :: mapAttrs ::
+  ## …`.
+  const IdentChars = {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_', '\'', '-'}
+  let sep = typeSig.find(" :: ")
+  if sep <= 0:
+    return typeSig
+  let head = typeSig[0 ..< sep]
+  for c in head:
+    if c notin IdentChars:
+      return typeSig
+  typeSig[sep + 4 .. ^1]
+
 proc toLibRecord(function: LibFunction): LibRecord =
   LibRecord(
     name: function.name,
     summary: function.doc.summary().flatten(),
-    typeSig: function.doc.typeSig.flatten(),
+    typeSig: function.doc.typeSig.flatten().stripTypeName(),
     location: function.file & ":" & $function.line,
     deprecated: function.doc.deprecated,
   )
@@ -1641,57 +1520,49 @@ proc libRecords(source, prefix: string): seq[LibRecord] =
   for function in functions:
     result.add(function.toLibRecord())
 
-proc writeLibDatabase(path: string, records: seq[LibRecord]) =
+proc writeLibPayload(path: string, records: seq[LibRecord]) =
   var lines: seq[string]
   for record in records:
     lines.add(encodeLibRecord(record))
-  writeIndexedDatabase(path, dbLib, lines)
+  writeBucketedPayload(path, lines)
 
 proc matchingLib(records: seq[LibRecord], query: string): seq[LibRecord] =
   for record in records:
     if query in record.name:
       result.add(record)
 
-proc loadMatchingLibDatabase(path, query: string): seq[LibRecord] =
+proc loadMatchingLibDatabase(db: Database, section: DbSection,
+    query: string): seq[LibRecord] =
   var records: seq[LibRecord]
-  for line in indexedBucketLines(path, dbLib, query.queryBucket):
+  for line in indexedBucketLines(db, section, query.queryBucket):
     let record = decodeLibRecord(line)
     if record.name.len > 0:
       records.add(record)
   matchingLib(records, query)
 
-proc printLib(records: seq[LibRecord], jsonOutput: bool) =
-  if jsonOutput:
-    var output = newJArray()
-    for record in records:
-      var item = %* {"name": record.name, "location": record.location}
-      if record.summary.len > 0:
-        item["summary"] = %record.summary
-      if record.typeSig.len > 0:
-        item["type"] = %record.typeSig
-      if record.deprecated:
-        item["deprecated"] = %true
-      output.add(item)
-    echo output.pretty()
-  else:
-    for record in records:
-      var line = record.name
-      if record.typeSig.len > 0:
-        line &= " :: " & record.typeSig
-      if record.deprecated:
-        line &= "  [deprecated]"
-      echo line
-      if record.summary.len > 0:
-        echo "    " & record.summary
-      echo "    " & record.location
+proc libJson(records: seq[LibRecord]): JsonNode =
+  result = newJArray()
+  for record in records:
+    var item = %* {"name": record.name, "location": record.location}
+    if record.summary.len > 0:
+      item["summary"] = %record.summary
+    if record.typeSig.len > 0:
+      item["type"] = %record.typeSig
+    if record.deprecated:
+      item["deprecated"] = %true
+    result.add(item)
 
-proc searchLib(config: Config) =
-  let records =
-    if config.libSource.len > 0:
-      matchingLib(libRecords(config.libSource, config.libPrefix), config.query)
-    else:
-      loadMatchingLibDatabase(config.database, config.query)
-  printLib(records, config.jsonOutput)
+proc printLib(records: seq[LibRecord]) =
+  for record in records:
+    var line = record.name
+    if record.typeSig.len > 0:
+      line &= " :: " & record.typeSig
+    if record.deprecated:
+      line &= "  [deprecated]"
+    echo line
+    if record.summary.len > 0:
+      echo "    " & record.summary
+    echo "    " & record.location
 
 proc packageName(attr, pname, version, output: string): string =
   result = if attr.len > 0: attr else: pname
@@ -1780,11 +1651,11 @@ proc packageFileRecords(
       if rel != "/":
         result.mgetOrPut(rel, initHashSet[string]()).incl(output.name)
 
-proc writePackagesDatabaseLegacy(
+proc writePackagesPayload(
   path: string,
   records: Table[string, HashSet[string]],
 ) =
-  ## Write a packages database in the legacy (path\tpkg,...) format.
+  ## Write a bucketed package payload in the (path\tpkg,...) line format.
   var paths = toSeq(records.keys)
   paths.sort()
 
@@ -1793,7 +1664,7 @@ proc writePackagesDatabaseLegacy(
     var packages = toSeq(records[p])
     packages.sort()
     lines.add(p & "\t" & packages.join(","))
-  writeIndexedDatabase(path, dbPackages, lines)
+  writeBucketedPayload(path, lines)
 
 proc parsePackages(lines: seq[string]): seq[FileEntry] =
   for line in lines:
@@ -1806,42 +1677,39 @@ proc matchingPackages(records: seq[FileEntry], query: string): seq[FileEntry] =
     if query in record.path:
       result.add(record)
 
-proc loadMatchingPackagesDatabase(path, query: string): seq[FileEntry] =
-  let kind = path.packageSearchKind
-  case kind
-  of dbPackages:
-    matchingPackages(parsePackages(indexedBucketLines(path, kind,
+proc loadMatchingPackagesDatabase(db: Database, section: DbSection,
+    query: string): seq[FileEntry] =
+  case section.encoding
+  of encBuckets:
+    matchingPackages(parsePackages(indexedBucketLines(db, section,
         query.queryBucket)), query)
-  of dbIndex:
-    matchingIndexV1(path, query)
-  of dbOptions, dbLib:
-    fail("unsupported package database format: " & path)
+  of encIndexV1:
+    matchingIndexV1(db, section, query)
 
-proc printPackages(records: seq[FileEntry], jsonOutput: bool) =
-  if jsonOutput:
-    var output = newJArray()
-    for record in records:
-      var item = %* {
-        "path": record.path,
-        "packages": record.packages,
-        "size": record.size,
-        "kind": $record.kind,
-        "executable": record.executable,
-      }
-      if record.target.len > 0:
-        item["target"] = %record.target
-      output.add(item)
-    echo output.pretty()
-  else:
-    for record in records:
-      let sizeStr = if record.size > 0: $record.size else: "-"
-      let execFlag = if record.executable: "x" else: " "
-      let kindChar = case record.kind
-        of fkDirectory: "d"
-        of fkSymlink: "l"
-        else: execFlag
-      echo kindChar & " " & sizeStr & "\t" & record.path & "\t" &
-        record.packages.join(", ")
+proc packagesJson(records: seq[FileEntry]): JsonNode =
+  result = newJArray()
+  for record in records:
+    var item = %* {
+      "path": record.path,
+      "packages": record.packages,
+      "size": record.size,
+      "kind": $record.kind,
+      "executable": record.executable,
+    }
+    if record.target.len > 0:
+      item["target"] = %record.target
+    result.add(item)
+
+proc printPackages(records: seq[FileEntry]) =
+  for record in records:
+    let sizeStr = if record.size > 0: $record.size else: "-"
+    let execFlag = if record.executable: "x" else: " "
+    let kindChar = case record.kind
+      of fkDirectory: "d"
+      of fkSymlink: "l"
+      else: execFlag
+    echo kindChar & " " & sizeStr & "\t" & record.path & "\t" &
+      record.packages.join(", ")
 
 proc countOptionShapes(manifest: JsonNode): tuple[options, other: int] =
   if manifest.kind != JObject:
@@ -1853,70 +1721,98 @@ proc countOptionShapes(manifest: JsonNode): tuple[options, other: int] =
     else:
       inc result.other
 
-proc buildLibDatabase(config: Config) =
-  let records = libRecords(config.libSource, config.libPrefix)
-  if records.len == 0:
-    fail("no documented Nix attributes found under " & config.libSource)
-  writeLibDatabase(config.output, records)
+proc optionsFromJson(path: string): seq[OptionRecord] =
+  let manifest = parseFile(path)
+  let shapes = countOptionShapes(manifest)
+  if shapes.options == 0:
+    fail(path & " contains no nixosOptionsDoc options")
+  if shapes.other > 0:
+    fail(path & " mixes options with non-option entries")
+  optionRecords(manifest)
+
+proc searchScopes(config: Config, db: Database, haveDb: bool): ScopeSet =
+  ## Which scopes this search covers, and where each is read from.
+  ##
+  ## Naming a source is enough to select its scope, so `--nix ./lib QUERY`
+  ## needs no `--lib`. With nothing named at all the search covers everything
+  ## available, which is the point of a global search.
+  let live = config.sourceScopes()
+  result = config.scopes + live
+  if result == {}:
+    result = if haveDb: db.scopes() else: {}
+  if result == {}:
+    fail("nothing to search")
+
+proc runSearch(config: Config) =
+  let live = config.sourceScopes()
+  let needsDb = config.scopes - live != {} or config.scopes + live == {}
+  var db: Database
+  if needsDb:
+    db = openDatabase(config.database)
+
+  let wanted = config.searchScopes(db, needsDb)
+  var
+    output = newJObject()
+    printed = 0
+  let labelled = wanted.card > 1
+
+  for scope in Scope:
+    if scope notin wanted:
+      continue
+
+    let fromDb = scope notin live
+    if fromDb and not db.hasScope(scope):
+      # An explicit request for a scope the database lacks is a mistake worth
+      # reporting; sweeping every scope and finding one absent is not.
+      if scope in config.scopes:
+        fail("database has no " & $scope & " section: " & config.database)
+      continue
+
+    let section = if fromDb: db.section(scope) else: default(DbSection)
+
+    # JSON keeps a key per searched scope so the shape does not depend on what
+    # matched; text output drops empty groups, which are pure noise.
+    template emit(records, toJson, toText: untyped) =
+      if config.jsonOutput:
+        output[$scope] = toJson(records)
+      elif records.len > 0:
+        if labelled:
+          if printed > 0: echo ""
+          echo "== " & $scope & " =="
+        toText(records)
+        inc printed
+
+    case scope
+    of scopePkg:
+      let records = loadMatchingPackagesDatabase(db, section, config.query)
+      emit(records, packagesJson, printPackages)
+    of scopeOpt:
+      let records =
+        if fromDb: loadMatchingOptionsDatabase(db, section, config.query)
+        else: matchingOptions(optionsFromJson(config.moduleOptions),
+          config.query)
+      emit(records, optionsJson, printOptions)
+    of scopeLib:
+      let records =
+        if fromDb: loadMatchingLibDatabase(db, section, config.query)
+        else: matchingLib(libRecords(config.libSource, config.libPrefix),
+          config.query)
+      emit(records, libJson, printLib)
+
   if config.jsonOutput:
-    echo( %* {"kind": "lib", "functions": records.len,
-        "output": config.output})
-  else:
-    stderr.writeLine(&"indexed {records.len} documented attributes")
+    echo output.pretty()
 
-proc buildDatabase(config: Config) =
-  if config.libSource.len > 0:
-    buildLibDatabase(config)
-    return
-
-  let manifest = parseFile(config.manifest)
-  let optionShapes = countOptionShapes(manifest)
-
-  if optionShapes.options > 0:
-    if optionShapes.other > 0:
-      fail("manifest mixes options with non-option entries")
-
-    let records = optionRecords(manifest)
-    writeOptionsDatabase(config.output, records)
-    if config.jsonOutput:
-      echo( %* {"kind": "options", "options": records.len,
-          "output": config.output})
-    else:
-      stderr.writeLine(&"indexed {records.len} options")
-    return
-
-  let outputs = manifestOutputs(manifest)
-  if outputs.len == 0:
-    fail("manifest did not contain options or existing package output paths")
-
-  let records = packageFileRecords(outputs)
-  writePackagesDatabaseLegacy(config.output, records)
-  if config.jsonOutput:
-    echo( %* {"kind": "packages", "paths": records.len, "outputs": outputs.len,
-        "output": config.output})
-  else:
-    stderr.writeLine(&"indexed {records.len} file paths from {outputs.len} outputs")
-
-proc runIndex(config: Config) =
-  ## Execute 'spam index': autonomous binary-cache indexing.
-  let outPath =
-    if config.output.len > 0: config.output
-    else: config.database
-
-  outPath.ensureParent()
-
+proc indexPackagesFromCache(config: Config, nixpkgs, payloadPath: string,
+    summary: var JsonNode) =
   var opts = defaultIndexOptions()
   opts.cacheUrl = config.indexCacheUrl
-  opts.nixpkgs = config.indexNixpkgs
+  opts.nixpkgs = nixpkgs
   opts.system = config.indexSystem
-  opts.scope = config.indexScope
+  opts.scope = config.indexAttrSet
   opts.attrs = config.indexAttrs
   opts.maxConcurrent = config.indexConcurrent
   opts.followRefs = config.indexFollowRefs
   opts.verbose = config.verbose
-
-  if opts.verbose:
-    stderr.writeLine("spam: starting autonomous index -> " & outPath)
 
   var spool = initPackageEntrySpool()
   defer: spool.cleanup()
@@ -1937,43 +1833,125 @@ proc runIndex(config: Config) =
       "is almost certainly incomplete")
 
   let records = spool.collectIndexRecords()
-  writeIndexV1Database(outPath, records)
+  writeIndexV1Payload(payloadPath, records)
+  summary = %* {
+    "files": records.len,
+    "entries": stats.entries,
+    "paths": stats.visited,
+    "listed": stats.listed,
+    "missing": stats.missing,
+  }
+
+proc indexPackagesFromManifest(config: Config, payloadPath: string,
+    summary: var JsonNode) =
+  let outputs = manifestOutputs(parseFile(config.manifest))
+  if outputs.len == 0:
+    fail("manifest contained no existing package output paths")
+  let records = packageFileRecords(outputs)
+  writePackagesPayload(payloadPath, records)
+  summary = %* {"files": records.len, "outputs": outputs.len}
+
+proc indexOptions(path, payloadPath: string, summary: var JsonNode) =
+  let records = optionsFromJson(path)
+  writeOptionsPayload(payloadPath, records)
+  summary = %* {"options": records.len}
+
+proc indexLib(source, prefix, payloadPath: string, summary: var JsonNode) =
+  let records = libRecords(source, prefix)
+  if records.len == 0:
+    fail("no documented Nix attributes found under " & source)
+  writeLibPayload(payloadPath, records)
+  summary = %* {"functions": records.len}
+
+proc runIndex(config: Config) =
+  let outPath =
+    if config.output.len > 0: config.output
+    else: config.database
+
+  let wanted =
+    if config.scopes != {}: config.scopes
+    else: config.sourceScopes()
+
+  var assembler = initDatabaseAssembler()
+  defer: assembler.cleanup()
+
+  var report = newJObject()
+
+  # A nixpkgs index draws each scope from a different place: packages from the
+  # binary cache, library functions from the tree, options from a
+  # nixosOptionsDoc build.
+  if config.indexNixpkgs.len > 0:
+    let nixpkgs = resolveNixpkgs(config.indexNixpkgs, config.verbose)
+    if config.verbose:
+      stderr.writeLine("spam: indexing " & nixpkgs & " (" & wanted.describe() &
+        ") -> " & outPath)
+
+    if scopePkg in wanted:
+      var summary: JsonNode
+      indexPackagesFromCache(config, config.indexNixpkgs,
+        assembler.reserve(scopePkg, encIndexV1), summary)
+      report["pkg"] = summary
+
+    if scopeLib in wanted:
+      let libDir = nixpkgs / "lib"
+      if not dirExists(libDir):
+        fail("no lib directory under " & nixpkgs)
+      var summary: JsonNode
+      indexLib(libDir, "lib", assembler.reserve(scopeLib, encBuckets), summary)
+      report["lib"] = summary
+
+    if scopeOpt in wanted:
+      var summary: JsonNode
+      indexOptions(nixosOptionsJson(nixpkgs, config.indexSystem,
+        config.verbose), assembler.reserve(scopeOpt, encBuckets), summary)
+      report["opt"] = summary
+  else:
+    if scopePkg in wanted:
+      var summary: JsonNode
+      indexPackagesFromManifest(config,
+        assembler.reserve(scopePkg, encBuckets), summary)
+      report["pkg"] = summary
+
+    if scopeOpt in wanted:
+      var summary: JsonNode
+      indexOptions(config.moduleOptions,
+        assembler.reserve(scopeOpt, encBuckets), summary)
+      report["opt"] = summary
+
+    if scopeLib in wanted:
+      var summary: JsonNode
+      indexLib(config.libSource, config.libPrefix,
+        assembler.reserve(scopeLib, encBuckets), summary)
+      report["lib"] = summary
+
+  assembler.finish(outPath)
 
   if config.jsonOutput:
-    echo( %* {"kind": "index", "format": "v1", "files": records.len,
-        "entries": stats.entries,
-        "paths": stats.visited,
-        "listed": stats.listed,
-        "missing": stats.missing,
-        "output": outPath})
+    report["output"] = %outPath
+    report["scopes"] = %wanted.describe()
+    echo report.pretty()
   else:
-    stderr.writeLine(&"indexed {records.len} file paths ({stats.entries} entries) " &
-      &"from {stats.listed}/{stats.visited} store paths -> {outPath}")
+    for scope in Scope:
+      if $scope in report:
+        stderr.writeLine("spam: " & $scope & " " & $report[$scope])
+    stderr.writeLine(&"wrote {wanted.describe()} -> {outPath}")
 
 proc main() {.used.} =
-  let config = parseArgs()
-  validate(config)
+  try:
+    let config = parseArgs()
+    validate(config)
 
-  case config.command
-  of cmdOpt:
-    case config.optSource
-    of optSourceJson:
-      searchOptionsJson(config)
-    of optSourceDb:
-      searchOptionsDb(config)
-    of optSourceNone:
+    case config.command
+    of cmdSearch:
+      runSearch(config)
+    of cmdIndex:
+      runIndex(config)
+    of cmdNone:
       discard
-  of cmdPkg:
-    printPackages(loadMatchingPackagesDatabase(config.database, config.query),
-      config.jsonOutput)
-  of cmdLib:
-    searchLib(config)
-  of cmdDb:
-    buildDatabase(config)
-  of cmdIndex:
-    runIndex(config)
-  of cmdNone:
-    discard
+  except DbError as e:
+    fail(e.msg)
+  except NixEvalError as e:
+    fail(e.msg)
 
 when isMainModule:
   main()
