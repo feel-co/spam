@@ -146,10 +146,13 @@ import filemeta
 import cache
 import dbformat
 import index
+import indexv2
 import zstdffi
 import libindex
 import nixdoc
 import nixeval
+
+export filemeta.sharedPrefixLen
 
 const
   DefaultDbName = "spam/spam.db"
@@ -675,17 +678,6 @@ proc closePartitionFiles(spool: var PackageEntrySpool) =
   for i in 0 ..< PackageSpoolPartitions:
     spool.partitionFiles[i].close()
   spool.partitionFilesOpen = false
-
-proc isUtf8Boundary(s: string, offset: int): bool =
-  offset <= 0 or offset >= s.len or (ord(s[offset]) and 0xc0) != 0x80
-
-proc sharedPrefixLen*(a, b: string): int =
-  let maxLen = min(a.len, b.len)
-  while result < maxLen and a[result] == b[result]:
-    inc result
-  while result > 0 and (not a.isUtf8Boundary(result) or
-      not b.isUtf8Boundary(result)):
-    dec result
 
 proc suffixFrom(path: string, shared: int): string =
   if shared >= path.len: "" else: path[shared .. ^1]
@@ -1685,6 +1677,8 @@ proc loadMatchingPackagesDatabase(db: Database, section: DbSection,
         query.queryBucket)), query)
   of encIndexV1:
     matchingIndexV1(db, section, query)
+  of encIndexV2:
+    matchingIndexV2(db, section, query)
 
 proc packagesJson(records: seq[FileEntry]): JsonNode =
   result = newJArray()
@@ -1833,7 +1827,7 @@ proc indexPackagesFromCache(config: Config, nixpkgs, payloadPath: string,
       "is almost certainly incomplete")
 
   let records = spool.collectIndexRecords()
-  writeIndexV1Payload(payloadPath, records)
+  writeIndexV2Payload(payloadPath, records)
   summary = %* {
     "files": records.len,
     "entries": stats.entries,
@@ -1889,7 +1883,7 @@ proc runIndex(config: Config) =
     if scopePkg in wanted:
       var summary: JsonNode
       indexPackagesFromCache(config, config.indexNixpkgs,
-        assembler.reserve(scopePkg, encIndexV1), summary)
+        assembler.reserve(scopePkg, encIndexV2), summary)
       report["pkg"] = summary
 
     if scopeLib in wanted:
