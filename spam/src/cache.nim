@@ -3,6 +3,7 @@
 ## Fetches .narinfo and .ls/.ls.xz file listings from a Nix binary cache
 ## (e.g. https://cache.nixos.org) for autonomous database indexing.
 import std/[asyncdispatch, httpclient, json, strutils, math, random, os]
+import zstdffi
 
 {.passL: "-lbrotlidec".}
 
@@ -124,6 +125,16 @@ type
     cacheUrl*: string
     cacheDir*: string
 
+  CacheResponse* = object
+    ## Result of a binary-cache fetch.
+    ##
+    ## `found` distinguishes "the cache does not have this object" (a normal,
+    ## expected outcome for unbuilt paths) from "we got an object". Without
+    ## that distinction an empty body is ambiguous, and treating a failure as
+    ## an absent object silently produces an incomplete index.
+    found*: bool
+    body*: string
+
 proc newCacheClient*(cacheUrl: string = DefaultCacheUrl): CacheClient =
   ## Create a new cache client for the given binary cache URL.
   let cacheHome =
@@ -197,11 +208,38 @@ proc storeCached(c: CacheClient, url, body, etag, lastModified: string) =
   moveFile(tmpBody, bodyPath)
   moveFile(tmpMeta, metaPath)
 
-proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
-  ## Fetch `url`, returning body on success or "" on 404.
+proc decodeBody*(raw, encoding, url: string): string =
+  ## Undo the HTTP `Content-Encoding` applied to a cache response.
+  ##
+  ## cache.nixos.org stores `.ls` and `.narinfo` objects pre-compressed and
+  ## serves them with a fixed `Content-Encoding`; the request's
+  ## `Accept-Encoding` is ignored, so every encoding the cache uses must be
+  ## handled here. Today that is `zstd` for essentially everything, with a
+  ## legacy tail of `br` objects.
+  ##
+  ## An unrecognised encoding raises rather than passing bytes through: doing
+  ## the latter turns into a silently empty index the moment the cache adopts
+  ## a new codec.
+  case encoding
+  of "", "identity":
+    raw
+  of "zstd":
+    try:
+      decompressStream(raw)
+    except ZstdError as e:
+      raise newException(IOError, "zstd decode failed for " & url & ": " & e.msg)
+  of "br":
+    brotliDecompress(raw)
+  else:
+    raise newException(IOError,
+      "unsupported content-encoding '" & encoding & "' for " & url)
+
+proc fetchWithRetry(c: CacheClient, url: string): Future[CacheResponse] {.async.} =
+  ## Fetch `url`, returning `found: false` on 404 and the decoded body otherwise.
   ## Retries on 5xx/network errors with exponential backoff + jitter.
   ## 5xx retries use a 5 s floor (cache.nixos.org caches server errors for ~5 s).
   ## Non-404 4xx responses raise PermanentHttpError immediately (no retry).
+  ## Exhausting all retries raises rather than reporting an absent object.
   ## Creates a fresh AsyncHttpClient per attempt to avoid concurrent reuse issues.
   let cached = c.loadCached(url)
   var delay = BaseDelayMs
@@ -222,11 +260,10 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
       of '2':
         let raw = await resp.body
         let encoding = resp.headers.getOrDefault(
-            "content-encoding").toLowerAscii()
-        result =
-          if encoding == "br": brotliDecompress(raw)
-          else: raw
-        c.storeCached(url, result,
+            "content-encoding").toLowerAscii().strip()
+        result.body = decodeBody(raw, encoding, url)
+        result.found = true
+        c.storeCached(url, result.body,
           resp.headers.getOrDefault("etag"),
           resp.headers.getOrDefault("last-modified"))
         try: client.close() except CatchableError: discard
@@ -234,13 +271,13 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
       of '3':
         try: client.close() except CatchableError: discard
         if statusStr.startsWith("304") and cached.body.len > 0:
-          return cached.body
+          return CacheResponse(found: true, body: cached.body)
         if attempt == MaxRetries - 1:
           raise newException(HttpRequestError, "HTTP " & statusStr & " for " & url)
       of '4':
         try: client.close() except CatchableError: discard
         if statusStr.startsWith("404"):
-          return ""
+          return CacheResponse(found: false, body: "")
         # 4xx (non-404) is a permanent client error; retrying will not help.
         raise newException(PermanentHttpError, "HTTP " & statusStr & " for " & url)
       else:
@@ -255,7 +292,9 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
         raise
 
     if attempt == MaxRetries - 1:
-      return ""
+      raise newException(HttpRequestError,
+        "giving up on " & url & " after " & $MaxRetries & " attempts" &
+        (if statusStr.len > 0: " (last status: " & statusStr & ")" else: ""))
 
     # 5xx responses from cache.nixos.org are cached for ~5 seconds, so
     # subsequent retries within that window will hit the same cached error.
@@ -267,18 +306,18 @@ proc fetchWithRetry(c: CacheClient, url: string): Future[string] {.async.} =
         delay + rand(delay div 4)
     await sleepAsync(waitMs)
     delay = min(delay * 2, ServerErrorFloorMs)
-  return ""
+  raise newException(HttpRequestError, "exhausted retries for " & url)
 
 proc fetchNarInfo*(c: CacheClient, hash: string): Future[NarInfo] {.async.} =
   ## Fetch and parse the .narinfo for the store path identified by `hash`.
   ## Returns an empty NarInfo (storePath == "") if not found.
   let url = c.cacheUrl & "/" & hash & ".narinfo"
-  let body = await c.fetchWithRetry(url)
-  if body.len == 0:
+  let response = await c.fetchWithRetry(url)
+  if not response.found:
     return NarInfo(hash: hash)
 
   result.hash = hash
-  for rawLine in body.splitLines():
+  for rawLine in response.body.splitLines():
     let line = rawLine.strip()
     if line.len == 0:
       continue
@@ -337,23 +376,33 @@ proc walkLsNode(path: string, node: JsonNode, result: var seq[LsEntry]) =
 proc fetchFileListing*(c: CacheClient, hash: string): Future[seq[
     LsEntry]] {.async.} =
   ## Fetch and parse the file listing (.ls or .ls.xz) for the store path `hash`.
-  ## Returns an empty seq if no listing is available.
+  ##
+  ## Returns an empty seq only when the cache genuinely has no listing for
+  ## `hash`. Every other failure raises: a listing that is present but
+  ## unreadable is a bug in spam, and reporting it as "no files" is how an
+  ## index silently ends up empty.
   let urlPlain = c.cacheUrl & "/" & hash & ".ls"
-  let body = await c.fetchWithRetry(urlPlain)
-  if body.len == 0:
+  let response = await c.fetchWithRetry(urlPlain)
+  if not response.found:
     # Try the .xz variant (older caches)
     let urlXz = c.cacheUrl & "/" & hash & ".ls.xz"
-    let bodyXz = await c.fetchWithRetry(urlXz)
-    if bodyXz.len == 0:
+    let responseXz = await c.fetchWithRetry(urlXz)
+    if not responseXz.found:
       return @[]
     raise newException(IOError, ".ls.xz listing available for " & hash &
       " but xz decompression is not implemented; refusing to build incomplete index")
 
-  try:
-    let root = parseJson(body)
-    let rootNode = root{"root"}
-    if rootNode == nil:
-      return @[]
-    walkLsNode("/", rootNode, result)
-  except JsonParsingError:
-    return @[]
+  if response.body.len == 0:
+    raise newException(IOError, "empty .ls listing for " & hash)
+
+  let root =
+    try:
+      parseJson(response.body)
+    except JsonParsingError as e:
+      raise newException(IOError,
+        "malformed .ls listing for " & hash & ": " & e.msg)
+
+  let rootNode = root{"root"}
+  if rootNode == nil:
+    raise newException(IOError, ".ls listing for " & hash & " has no root node")
+  walkLsNode("/", rootNode, result)
