@@ -1,19 +1,48 @@
 # spam-db
 
-Rust library for reading [spam](https://github.com/feel-co/spam) databases.
-
-SPAM indexes Nix package closures and `nixosOptionsDoc` output into compressed,
-bucket-indexed databases. This crate lets you open those databases and run
-substring queries against them.
+Rust library for reading [spam](https://github.com/feel-co/spam) databases. SPAM
+indexes Nix package closures, `nixosOptionsDoc` output and documented Nix
+library functions into compressed databases. This crate lets you open those
+databases and run substring queries against them.
 
 ## Usage
 
 ```toml
 [dependencies]
-spam-db = "0.2"
+spam-db = "0.3.0"
 ```
 
-### Query an options database
+A database holds up to three independent sections, one per scope: `pkg` for
+package file paths, `opt` for NixOS module options, and `lib` for documented
+library functions. A query touches only the section of the scope it asks for.
+
+### Query the scopes a database happens to carry
+
+```rust
+use spam_db::SpamDb;
+
+let db = SpamDb::open("spam.db")?;
+
+if let Some(pkg) = db.packages()? {
+    for rec in pkg.query("/bin/")? {
+        println!("{} -> {}", rec.path, rec.packages.join(", "));
+    }
+}
+
+if let Some(opt) = db.options()? {
+    for rec in opt.query("services.nginx")? {
+        println!("{}", rec.name);
+    }
+}
+
+if let Some(lib) = db.functions()? {
+    for rec in lib.query("mapAttrs")? {
+        println!("{} at {}", rec.name, rec.location);
+    }
+}
+```
+
+### Open a single scope directly
 
 ```rust
 use spam_db::OptionsDb;
@@ -27,63 +56,51 @@ for rec in db.query("services.nginx")? {
 }
 ```
 
-### Query a packages database
-
-```rust
-use spam_db::PackagesDb;
-
-let db = PackagesDb::open("files.db")?;
-for rec in db.query("/bin/")? {
-    println!("{} -> {}", rec.path, rec.packages.join(", "));
-}
-```
-
-### Auto-detect database kind
-
-```rust
-use spam_db::SpamDb;
-
-match SpamDb::open("unknown.db")? {
-    SpamDb::Options(db) => { /* ... */ }
-    SpamDb::Packages(db) => { /* ... */ }
-    SpamDb::Index(db) => { /* ... */ }
-}
-```
+`PackagesDb::open` and `FunctionsDb::open` behave the same way, and fail if the
+database has no section for that scope.
 
 ## Database format
 
-`options` and `packages` databases are bucket-indexed binary files:
+<!--markdownlint-disable MD013-->
 
 ```plaintext
-# spam-db-v3\t{options|packages}\n
+"# spam-db-v2\n"
+[u32le section count]
+[count x 20-byte entries: (scope: u16le, encoding: u16le, offset: u64le, length: u64le)]
+[section payloads, in table order]
+```
+
+<!--markdownlint-enable MD013-->
+
+Section offsets are relative to the first payload byte. Two encodings exist.
+
+`Buckets` is a 256-bucket layout, used for options, library functions and
+package sections built from a local manifest:
+
+```plaintext
 [256 x 16-byte index entries: (offset: u64le, length: u64le)]
 [concatenated zstd-compressed bucket blobs]
 ```
 
-Each line in the database is placed in every bucket corresponding to a unique
-byte in its search key. Queries decompress only the bucket for `query[0]`,
-keeping lookup sublinear in the total database size.
+Each record is placed in every bucket corresponding to a unique byte of its
+search key. Queries decompress only the bucket for `query[0]`, keeping lookup
+sublinear in the total section size.
 
-`index` databases are compact package streams:
+`IndexV1` is used for the package section of a nixpkgs index. Records are
+prefix-delta encoded into zstd blocks of roughly 128 KiB, with a trigram index
+mapping each three-byte sequence to the blocks containing it, so a substring
+query decompresses only blocks that can match. Trigrams appearing in too many
+blocks are marked skipped and carry no postings.
 
-```plaintext
-# spam-db-v3\tindex\n
-[one zstd-compressed package stream]
-```
-
-The stream groups entries by package and prefix-delta encodes sorted paths to
-avoid the path-record duplication used by the bucketed format.
-
-The `packages` kind is produced by `spam db build` from local package manifests.
-The `index` kind is produced by `spam index` from nixpkgs and binary-cache file
-listings. `PackagesDb` can query both kinds, but consumers can distinguish them
-with `SpamDb::kind()`.
+Single-kind `# spam-db-v1` databases written by earlier releases are read as one
+synthesised section.
 
 ## Building spam databases
 
 Use the [spam CLI](https://github.com/feel-co/spam):
 
 ```bash
-spam db build --manifest packages.json --output files.db
-spam db build --manifest options.json --output options.db
+spam index --nixpkgs '<nixpkgs>' --output spam.db
+spam index --manifest packages.json --nix ./lib --prefix lib --output all.db
+spam index --options options.json --output options.db
 ```
