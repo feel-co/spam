@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::{
-    Error, Result, indexv1,
+    Error, Result, indexv1, indexv2,
     format::{DbFile, Scope, Section, SectionEncoding},
 };
 
@@ -61,6 +61,7 @@ impl PackagesDb {
         match self.section.encoding {
             SectionEncoding::Buckets => self.query_bucketed(query),
             SectionEncoding::IndexV1 => indexv1::query(&self.db, self.section, query),
+            SectionEncoding::IndexV2 => indexv2::query(&self.db, self.section, query),
         }
     }
 

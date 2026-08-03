@@ -64,6 +64,8 @@ pub enum SectionEncoding {
     Buckets,
     /// Blocked, prefix-delta encoded records with a trigram index.
     IndexV1,
+    /// Column-major row groups with a trigram index.
+    IndexV2,
 }
 
 impl SectionEncoding {
@@ -71,6 +73,7 @@ impl SectionEncoding {
         match code {
             1 => Ok(SectionEncoding::Buckets),
             2 => Ok(SectionEncoding::IndexV1),
+            3 => Ok(SectionEncoding::IndexV2),
             other => Err(Error::InvalidDatabase(format!(
                 "unknown section encoding {other}"
             ))),

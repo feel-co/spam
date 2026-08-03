@@ -61,6 +61,7 @@
 
 mod format;
 mod indexv1;
+mod indexv2;
 
 pub mod error;
 pub mod functions;

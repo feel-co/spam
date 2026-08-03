@@ -6,6 +6,7 @@ const SCOPE_LIB: u16 = 2;
 
 const ENC_BUCKETS: u16 = 1;
 const ENC_INDEX_V1: u16 = 2;
+const ENC_INDEX_V2: u16 = 3;
 
 /// Build the payload of a bucketed section from raw tab-separated records.
 fn bucketed_payload(lines: &[&str]) -> Vec<u8> {
@@ -198,6 +199,176 @@ fn index_v1_payload(records: &[IndexRecord]) -> Vec<u8> {
         (3u16, block_compressed),
         (4u16, trigram_section),
         (5u16, postings_section),
+    ];
+
+    let mut table = Vec::new();
+    let mut offset = (fixed.len() + payloads.len() * 20) as u64;
+    for (kind, payload) in &payloads {
+        table.extend_from_slice(&kind.to_le_bytes());
+        table.extend_from_slice(&0u16.to_le_bytes());
+        table.extend_from_slice(&offset.to_le_bytes());
+        table.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        offset += payload.len() as u64;
+    }
+
+    let mut out = fixed;
+    out.extend_from_slice(&table);
+    for (_, payload) in &payloads {
+        out.extend_from_slice(payload);
+    }
+    out
+}
+
+/// Build the payload of an `index-v2` section holding a single row group.
+///
+/// Mirrors the Nim writer: interned package sets, column-major storage with
+/// the size column split into byte planes, and a trigram index over the groups.
+fn index_v2_payload(records: &[IndexRecord]) -> Vec<u8> {
+    const COLUMNS: usize = 11;
+    const SIZE_PLANES: usize = 5;
+
+    let mut names: Vec<&str> = records.iter().map(|r| r.package).collect();
+    names.sort_unstable();
+    names.dedup();
+
+    // One interned set per distinct package list; here every record has one
+    // package, so a set is a single id.
+    let mut sets: Vec<Vec<usize>> = Vec::new();
+    let mut set_of = Vec::new();
+    for record in records {
+        let id = names.iter().position(|n| *n == record.package).unwrap();
+        let key = vec![id];
+        let index = sets.iter().position(|s| *s == key).unwrap_or_else(|| {
+            sets.push(key);
+            sets.len() - 1
+        });
+        set_of.push(index);
+    }
+
+    let mut columns: Vec<Vec<u8>> = vec![Vec::new(); COLUMNS];
+    let mut previous = "";
+    let mut previous_shared: i32 = 0;
+    for (i, record) in records.iter().enumerate() {
+        let shared = previous
+            .char_indices()
+            .zip(record.path.char_indices())
+            .take_while(|((_, a), (_, b))| a == b)
+            .map(|((i, c), _)| i + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        let diff = shared as i32 - previous_shared;
+        if diff > -127 && diff < 127 {
+            columns[0].push(diff as u8);
+        } else {
+            columns[0].push(0x80);
+            columns[0].push((diff >> 8) as u8);
+            columns[0].push(diff as u8);
+        }
+
+        let suffix = &record.path[shared..];
+        put_varint(&mut columns[1], suffix.len() as u64);
+        columns[2].extend_from_slice(suffix.as_bytes());
+        columns[3].push(record.kind as u8 | if record.executable { 4 } else { 0 });
+
+        if record.kind == 0 {
+            for plane in 0..SIZE_PLANES {
+                columns[4 + plane].push((record.size >> (8 * plane)) as u8);
+            }
+        }
+        if record.kind == 2 {
+            put_varint(&mut columns[10], record.target.len() as u64);
+            columns[10].extend_from_slice(record.target.as_bytes());
+        }
+        put_varint(&mut columns[9], set_of[i] as u64);
+
+        previous = record.path;
+        previous_shared = shared as i32;
+    }
+
+    let mut column_data = Vec::new();
+    let mut lengths = [0u32; COLUMNS];
+    for (i, column) in columns.iter().enumerate() {
+        let compressed = if column.is_empty() {
+            Vec::new()
+        } else {
+            zstd::encode_all(column.as_slice(), 19).unwrap()
+        };
+        lengths[i] = compressed.len() as u32;
+        column_data.extend_from_slice(&compressed);
+    }
+
+    // Group directory: one group covering every record, starting at offset 0.
+    let mut directory = 0u64.to_le_bytes().to_vec();
+    directory.extend_from_slice(&0u32.to_le_bytes());
+    directory.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    for length in &lengths {
+        directory.extend_from_slice(&length.to_le_bytes());
+    }
+
+    // Every trigram lands in the only group, so each posting list is [0].
+    let mut trigrams: Vec<u32> = Vec::new();
+    for record in records {
+        for window in record.path.as_bytes().windows(3) {
+            trigrams.push(
+                (u32::from(window[0]) << 16) | (u32::from(window[1]) << 8) | u32::from(window[2]),
+            );
+        }
+    }
+    trigrams.sort_unstable();
+    trigrams.dedup();
+
+    let mut postings = Vec::new();
+    let mut trigram_raw = (trigrams.len() as u32).to_le_bytes().to_vec();
+    for trigram in &trigrams {
+        trigram_raw.push((trigram >> 16) as u8);
+        trigram_raw.push((trigram >> 8) as u8);
+        trigram_raw.push(*trigram as u8);
+        trigram_raw.push(0); // flags: not skipped
+        trigram_raw.extend_from_slice(&(postings.len() as u64).to_le_bytes()[..5]);
+        put_varint(&mut postings, 0);
+    }
+
+    let mut names_raw = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            names_raw.push(b'\n');
+        }
+        names_raw.extend_from_slice(name.as_bytes());
+    }
+
+    let mut sets_raw = Vec::new();
+    for ids in &sets {
+        put_varint(&mut sets_raw, ids.len() as u64);
+        let mut previous = 0usize;
+        for id in ids {
+            put_varint(&mut sets_raw, (id - previous) as u64);
+            previous = *id;
+        }
+    }
+
+    let zc = |data: &[u8]| -> Vec<u8> {
+        if data.is_empty() {
+            Vec::new()
+        } else {
+            zstd::encode_all(data, 19).unwrap()
+        }
+    };
+
+    let mut fixed = (records.len() as u64).to_le_bytes().to_vec();
+    fixed.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    fixed.extend_from_slice(&(sets.len() as u32).to_le_bytes());
+    fixed.extend_from_slice(&1u32.to_le_bytes()); // group count
+    fixed.extend_from_slice(&(trigrams.len() as u32).to_le_bytes());
+    fixed.extend_from_slice(&(COLUMNS as u32).to_le_bytes());
+    fixed.extend_from_slice(&6u32.to_le_bytes()); // section count
+
+    let payloads = [
+        (1u16, zc(&names_raw)),
+        (2u16, zc(&sets_raw)),
+        (3u16, zc(&directory)),
+        (4u16, column_data),
+        (5u16, zc(&trigram_raw)),
+        (6u16, zc(&postings)),
     ];
 
     let mut table = Vec::new();
@@ -520,6 +691,132 @@ fn index_v1_query_with_an_unknown_trigram_matches_nothing() {
     let db = spam_db::PackagesDb::open(f.path()).unwrap();
 
     assert!(db.query("ZZZNOMATCHZZZ").unwrap().is_empty());
+}
+
+fn v2_sample() -> Vec<IndexRecord> {
+    vec![
+        IndexRecord {
+            path: "/bin/hello",
+            package: "hello-2.12",
+            size: 29488,
+            kind: 0,
+            executable: true,
+            target: "",
+        },
+        IndexRecord {
+            path: "/bin/hello-link",
+            package: "hello-2.12",
+            size: 0,
+            kind: 2,
+            executable: false,
+            target: "/bin/hello",
+        },
+        IndexRecord {
+            path: "/lib",
+            package: "foo-1.0",
+            size: 0,
+            kind: 1,
+            executable: false,
+            target: "",
+        },
+        IndexRecord {
+            path: "/lib/libfoo.so",
+            package: "foo-1.0",
+            size: 153600,
+            kind: 0,
+            executable: false,
+            target: "",
+        },
+    ]
+}
+
+#[test]
+fn index_v2_query_returns_full_metadata() {
+    use spam_db::packages::FileKind;
+
+    let bytes = build_db(&[(SCOPE_PKG, ENC_INDEX_V2, index_v2_payload(&v2_sample()))]);
+    let f = TempFile::write("spam_test_indexv2.db", &bytes);
+    let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+    let results = db.query("/bin/hello").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].path, "/bin/hello");
+    assert_eq!(results[0].size, 29488);
+    assert!(results[0].executable);
+    assert_eq!(results[0].kind, FileKind::Regular);
+    assert_eq!(results[0].packages, vec!["hello-2.12"]);
+    assert_eq!(results[1].path, "/bin/hello-link");
+    assert_eq!(results[1].kind, FileKind::Symlink);
+    assert_eq!(results[1].target, "/bin/hello");
+    assert_eq!(results[1].size, 0);
+
+    // A directory carries no size and no target, and contributes nothing to
+    // either column; the row cursors still have to stay aligned across it.
+    let libs = db.query("/lib").unwrap();
+    assert_eq!(libs.len(), 2);
+    assert_eq!(libs[0].kind, FileKind::Directory);
+    assert_eq!(libs[0].size, 0);
+    assert_eq!(libs[1].path, "/lib/libfoo.so");
+    assert_eq!(libs[1].size, 153600);
+    assert_eq!(libs[1].packages, vec!["foo-1.0"]);
+}
+
+#[test]
+fn index_v2_reports_its_encoding() {
+    use spam_db::{Scope, SectionEncoding, SpamDb};
+
+    let bytes = build_db(&[(SCOPE_PKG, ENC_INDEX_V2, index_v2_payload(&v2_sample()))]);
+    let f = TempFile::write("spam_test_indexv2_encoding.db", &bytes);
+    let db = SpamDb::open(f.path()).unwrap();
+    assert_eq!(db.scopes(), &[(Scope::Pkg, SectionEncoding::IndexV2)]);
+}
+
+#[test]
+fn index_v2_query_shorter_than_a_trigram_scans_every_group() {
+    let bytes = build_db(&[(SCOPE_PKG, ENC_INDEX_V2, index_v2_payload(&v2_sample()))]);
+    let f = TempFile::write("spam_test_indexv2_short.db", &bytes);
+    let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+    assert_eq!(db.query("he").unwrap().len(), 2);
+}
+
+#[test]
+fn index_v2_query_with_an_unknown_trigram_matches_nothing() {
+    let bytes = build_db(&[(SCOPE_PKG, ENC_INDEX_V2, index_v2_payload(&v2_sample()))]);
+    let f = TempFile::write("spam_test_indexv2_miss.db", &bytes);
+    let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+    assert!(db.query("ZZZNOMATCHZZZ").unwrap().is_empty());
+}
+
+#[test]
+fn index_v2_multi_byte_paths_survive_prefix_deltas() {
+    let records = vec![
+        IndexRecord {
+            path: "/\u{1D51E}",
+            package: "unicode-1.0",
+            size: 1,
+            kind: 0,
+            executable: false,
+            target: "",
+        },
+        IndexRecord {
+            path: "/\u{1D51F}",
+            package: "unicode-1.0",
+            size: 2,
+            kind: 0,
+            executable: false,
+            target: "",
+        },
+    ];
+    let bytes = build_db(&[(SCOPE_PKG, ENC_INDEX_V2, index_v2_payload(&records))]);
+    let f = TempFile::write("spam_test_indexv2_unicode.db", &bytes);
+    let db = spam_db::PackagesDb::open(f.path()).unwrap();
+
+    let results = db.query("\u{1D51F}").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, "/\u{1D51F}");
+    assert_eq!(results[0].size, 2);
 }
 
 #[test]
