@@ -12,7 +12,15 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        system: ['x86_64-linux', 'aarch64-linux', 'aarch64-darwin'] # tier 1 Nixpkgs targets
+        # Tier 1 Nixpkgs targets. There is no NixOS module system on Darwin, so
+        # those indexes carry packages and library functions only.
+        include:
+          - system: 'x86_64-linux'
+            scope: 'pkg,opt,lib'
+          - system: 'aarch64-linux'
+            scope: 'pkg,opt,lib'
+          - system: 'aarch64-darwin'
+            scope: 'pkg,lib'
     name: Index ${{ matrix.system }}
     steps:
     - uses: actions/checkout@v6
@@ -68,6 +76,8 @@ jobs:
     - name: Generate spam index
       run: |
         spam index \
+          --nixpkgs '<nixpkgs>' \
+          --scope ${{ matrix.scope }} \
           --output ./spam-index-${{ matrix.system }} \
           --system ${{ matrix.system }} \
           --concurrent 8 \
