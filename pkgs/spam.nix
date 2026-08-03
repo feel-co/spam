@@ -6,6 +6,7 @@
   pandoc,
   zstd,
   brotli,
+  nixdoc-ffi,
   callPackage,
 }:
 let
@@ -49,6 +50,7 @@ buildNimPackage (finalAttrs: {
     openssl
     zstd
     brotli
+    nixdoc-ffi
   ];
 
   postBuild = ''
