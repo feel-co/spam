@@ -86,14 +86,19 @@ Each record is placed in every bucket corresponding to a unique byte of its
 search key. Queries decompress only the bucket for `query[0]`, keeping lookup
 sublinear in the total section size.
 
-`IndexV1` is used for the package section of a nixpkgs index. Records are
-prefix-delta encoded into zstd blocks of roughly 128 KiB, with a trigram index
-mapping each three-byte sequence to the blocks containing it, so a substring
-query decompresses only blocks that can match. Trigrams appearing in too many
-blocks are marked skipped and carry no postings.
+`IndexV2` is used for the package section of a nixpkgs index. Records are
+grouped into row groups, and each group stores every column in its own zstd
+frame: prefix-delta path columns, a flags byte, the file size split into five
+byte planes, an interned package-set id, and symlink targets. A trigram index
+over the groups narrows the candidate set, and because matching only needs the
+three path columns, the size, package and target columns of a group are
+decompressed solely when that group contains a hit. `IndexV1`, indicated by
+`# spam-db-v1`, is the earlier row-major format, still read (as one synthesised
+section) so existing databases keep working. Records are prefix-delta encoded
+into zstd blocks of roughly 128 KiB with a trigram index over the blocks.
 
-Single-kind `# spam-db-v1` databases written by earlier releases are read as one
-synthesised section.
+In both, trigrams appearing in too many blocks or groups are marked skipped and
+carry no postings, since intersecting them would cost more than it saves.
 
 ## Building spam databases
 
