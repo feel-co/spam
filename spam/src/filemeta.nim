@@ -26,6 +26,19 @@ type
     packages*: seq[string]
       ## Package names that ship this entry (may be multiple via hardlinks).
 
+proc isUtf8Boundary*(s: string, offset: int): bool =
+  offset <= 0 or offset >= s.len or (ord(s[offset]) and 0xc0) != 0x80
+
+proc sharedPrefixLen*(a, b: string): int =
+  ## Length of the common prefix of `a` and `b`, snapped back to a UTF-8
+  ## scalar boundary so a split never lands mid-codepoint.
+  let maxLen = min(a.len, b.len)
+  while result < maxLen and a[result] == b[result]:
+    inc result
+  while result > 0 and (not a.isUtf8Boundary(result) or
+      not b.isUtf8Boundary(result)):
+    dec result
+
 proc encodeEntry*(e: FileEntry): string =
   ## Encode a FileEntry to a tab-separated database line:
   ##   path\tkind\tsize\texec\ttarget\tpkg1,pkg2,...

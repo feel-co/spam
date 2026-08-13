@@ -1,13 +1,14 @@
 [package]
-name = "spam-db"
-version = "0.2.4"
-edition = "2024"
-description = "Parser and query library for SPAM databases"
-license = "MPL-2.0"
-repository = "https://github.com/feel-co/spam"
-readme = "README.md"
-keywords = ["nix", "nixos", "database", "search"]
-categories = ["parser-implementations", "database"]
+name         = "spam-db"
+version      = "0.3.0"
+description  = "Parser and query library for SPAM databases"
+edition      = "2024"
+rust-version = "1.95.0"
+license      = "MPL-2.0"
+repository   = "https://github.com/feel-co/spam"
+readme       = true
+keywords     = ["nix", "nixos", "database", "search"]
+categories   = ["parser-implementations", "database"]
 
 [dependencies]
 zstd = "0.13.3"
@@ -17,4 +18,8 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 harness = false
-name = "query"
+name    = "query"
+
+[profile.release]
+lto       = true
+opt-level = 3

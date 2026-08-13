@@ -45,6 +45,23 @@ type
       ## If true, follow transitive store references (BFS). Much slower.
     verbose*: bool
 
+  IndexStats* = object
+    ## Outcome counts for an indexing run.
+    ##
+    ## `listed` vs `missing` is the signal that matters: a store path the cache
+    ## has no listing for is normal, but a run where nearly every path is
+    ## "missing" means spam failed to read the listings rather than that they
+    ## are absent. Reporting the split makes that visible instead of it showing
+    ## up only as a suspiciously small database.
+    visited*: int
+      ## Store paths fetched.
+    listed*: int
+      ## Store paths that yielded a file listing.
+    missing*: int
+      ## Store paths the cache had no listing for.
+    entries*: int
+      ## File entries emitted.
+
 proc defaultIndexOptions*(): IndexOptions =
   IndexOptions(
     cacheUrl: DefaultCacheUrl,
@@ -79,8 +96,8 @@ proc enumeratePackagesFor(opts: IndexOptions, attr: string): seq[StoreOutput] =
 
   let nix = startProcess("nix-env", args = args, options = {poUsePath})
 
-  # Parse stdout incrementally — the XML for 126K packages is easily
-  # 100+ MiB; buffering it all with readAll() causes OOM.
+  # Parse stdout incrementally; the XML for 126K packages is easily
+  # 100+ MiB; buffering it all with readAll() would cause an OOM.
   var parser: XmlParser
   open(parser, nix.outputStream, "nix-env output")
   defer: parser.close()
@@ -169,14 +186,12 @@ proc indexWithCache*(
   outputs: seq[StoreOutput],
   opts: IndexOptions,
   emitEntry: proc(entry: FileEntry),
-): Future[int] {.async.} =
+): Future[IndexStats] {.async.} =
   ## Perform BFS reference traversal starting from `outputs`.
   ##
   ## For each store path, fetch the binary cache file listing and emit entries
   ## as soon as they are available. When followRefs is enabled, also fetch
   ## .narinfo and enqueue direct references.
-  ##
-  ## Returns the number of emitted file entries.
   let client = newCacheClient(opts.cacheUrl)
 
   # visited: hashes we've already fetched or enqueued
@@ -219,8 +234,14 @@ proc indexWithCache*(
         let entries = await lsFutures[i]
 
         inc processed
+        inc result.visited
+        if entries.len > 0:
+          inc result.listed
+        else:
+          inc result.missing
         if opts.verbose and processed mod 100 == 0:
-          stderr.writeLine("spam: indexed " & $processed & " paths, queue=" & $queue.len)
+          stderr.writeLine("spam: indexed " & $processed & " paths, queue=" &
+            $queue.len & ", listings=" & $result.listed & "/" & $result.missing)
 
         # Enqueue newly discovered references (only if followRefs is enabled)
         if opts.followRefs:
@@ -254,7 +275,7 @@ proc indexWithCache*(
             target: entry.target,
             packages: @[attr],
           ))
-          inc result
+          inc result.entries
 
       except Exception as e:
         # Catch both CatchableError and Defect (e.g. AssertionDefect from
@@ -273,13 +294,14 @@ proc indexWithCache*(
 
   if opts.verbose:
     stderr.writeLine("spam: traversal complete. visited=" & $visited.len &
-      " unique paths, files=" & $result)
+      " unique paths, with listings=" & $result.listed &
+      ", without=" & $result.missing & ", files=" & $result.entries)
 
 
 proc buildIndexDatabase*(
   opts: IndexOptions,
   emitEntry: proc(entry: FileEntry),
-): Future[int] {.async.} =
+): Future[IndexStats] {.async.} =
   ## Top-level entry: enumerate packages via nix-env, then index via binary cache.
   let outputs = enumeratePackages(opts)
   if opts.verbose:
