@@ -1,6 +1,7 @@
 {
   lib,
   stdenv,
+  fixDarwinDylibNames,
   rustPlatform,
   fetchFromGitHub,
 }:
@@ -12,9 +13,11 @@ rustPlatform.buildRustPackage (finalAttrs: {
   src = fetchFromGitHub {
     owner = "feel-co";
     repo = "nixdoc";
-    rev = "04f125b4c56ccadc31f11245366c830e4b8d60b2";
-    hash = "sha256-PNaf6N8fS66EICfZwY7lpNjTr+zdBv9QaJuRENPV/Q8=";
+    rev = "2d3cb7c9b6dd8b7f48cd90a99980b8c47b965c7f";
+    hash = "sha256-Zu2MAYNsmz2gCYUX8uS0dtwWcul7c/k1MN2bNluJPrY=";
   };
+
+  nativeBuildInputs = lib.optional stdenv.hostPlatform.isDarwin fixDarwinDylibNames;
 
   cargoLock.lockFile = "${finalAttrs.src}/Cargo.lock";
   buildAndTestSubdir = "crates/nixdoc-ffi";
