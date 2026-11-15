@@ -44,7 +44,7 @@ proc resolveNixpkgs*(spec: string, verbose = false): string =
   if name.len == 0:
     nixFail("empty --nixpkgs value")
 
-  let resolved = run("nix-instantiate", ["--find-file", name],
+  let resolved = run("nix-instantiate", ["--quiet", "--find-file", name],
     "resolving " & spec, verbose)
   if not dirExists(resolved):
     nixFail(spec & " resolved to " & resolved & ", which is not a directory")
