@@ -21,7 +21,8 @@ const MAX_SECTIONS: usize = 64;
 
 use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    os::unix::fs::FileExt,
+    path::Path,
 };
 
 use crate::{Error, Result};
@@ -109,7 +110,7 @@ pub struct Section {
 /// ```
 #[derive(Debug)]
 pub(crate) struct DbFile {
-    path: PathBuf,
+    file: std::fs::File,
     payload_start: u64,
     sections: Vec<Section>,
 }
@@ -143,7 +144,7 @@ impl DbFile {
                 .checked_sub(header_len)
                 .ok_or_else(|| Error::InvalidDatabase("file is too short".into()))?;
             return Ok(Self {
-                path,
+                file,
                 payload_start: header_len,
                 sections: vec![legacy_section(kind, length)?],
             });
@@ -197,7 +198,7 @@ impl DbFile {
         }
 
         Ok(Self {
-            path,
+            file,
             payload_start,
             sections,
         })
@@ -241,10 +242,8 @@ impl DbFile {
             .checked_add(offset)
             .ok_or_else(|| Error::InvalidDatabase("section offset overflow".into()))?;
 
-        let mut file = std::fs::File::open(&self.path)?;
         let mut buffer = vec![0u8; length];
-        file.seek(SeekFrom::Start(start))?;
-        file.read_exact(&mut buffer)?;
+        self.file.read_exact_at(&mut buffer, start)?;
         Ok(buffer)
     }
 
