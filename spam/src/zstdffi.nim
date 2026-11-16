@@ -40,6 +40,8 @@ type
     size*: csize_t
     pos*: csize_t
 
+let zstdMagicNumber* {.importc: "ZSTD_MAGICNUMBER", header: "zstd.h".}: uint32
+
 proc zstdGetFrameContentSize*(src: pointer, srcSize: csize_t): uint64 {.
     importc: "ZSTD_getFrameContentSize".}
 proc zstdDecompress*(
