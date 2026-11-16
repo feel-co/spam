@@ -197,40 +197,38 @@ pub(crate) fn query(
         let suffixes = column(COL_SUFFIX)?;
 
         let rows = group.record_count as usize;
-        let mut paths: Vec<String> = Vec::with_capacity(rows);
-        let mut hits: Vec<usize> = Vec::new();
+        let suffixes = std::str::from_utf8(&suffixes)
+            .map_err(|_| invalid("non-UTF-8 path suffix"))?;
+        let mut hits: Vec<(usize, String)> = Vec::new();
         let mut diff_pos = 0usize;
         let mut len_pos = 0usize;
         let mut suffix_pos = 0usize;
         let mut shared: i64 = 0;
-        let mut previous = String::new();
+        let mut current = String::new();
 
         for row in 0..rows {
             shared += read_diff(&diffs, &mut diff_pos)?;
-            if shared < 0 || shared as usize > previous.len() {
+            if shared < 0 || shared as usize > current.len() {
                 return Err(invalid("invalid v2 path prefix boundary"));
             }
             let shared_len = shared as usize;
-            if !previous.is_char_boundary(shared_len) {
+            if !current.is_char_boundary(shared_len) {
                 return Err(invalid("invalid v2 path prefix boundary"));
             }
             let suffix_len = read_varint(&suffix_lens, &mut len_pos)? as usize;
             let end = suffix_pos
                 .checked_add(suffix_len)
                 .ok_or_else(|| invalid("v2 suffix slice overflow"))?;
-            if end > suffixes.len() {
-                return Err(invalid("truncated v2 path suffix"));
-            }
-            let suffix = std::str::from_utf8(&suffixes[suffix_pos..end])
-                .map_err(|_| invalid("non-UTF-8 path suffix"))?;
+            let suffix = suffixes
+                .get(suffix_pos..end)
+                .ok_or_else(|| invalid("truncated or non-UTF-8 v2 path suffix"))?;
             suffix_pos = end;
 
-            let path = format!("{}{}", &previous[..shared_len], suffix);
-            if path.contains(query) {
-                hits.push(row);
+            current.truncate(shared_len);
+            current.push_str(suffix);
+            if current.contains(query) {
+                hits.push((row, current.clone()));
             }
-            previous = path.clone();
-            paths.push(path);
         }
 
         if hits.is_empty() {
@@ -291,20 +289,24 @@ pub(crate) fn query(
                 target_pos = end;
             }
 
-            if hit_index < hits.len() && hits[hit_index] == row {
+            if hit_index < hits.len() && hits[hit_index].0 == row {
+                let path = std::mem::take(&mut hits[hit_index].1);
                 hit_index += 1;
                 let ids = sets
                     .get(set_id)
                     .ok_or_else(|| invalid("invalid v2 package set id"))?;
                 let packages = ids.iter().map(|id| names[*id].clone()).collect();
                 records.push(FileRecord {
-                    path: std::mem::take(&mut paths[row]),
+                    path,
                     packages,
                     size,
                     kind,
                     executable: flag_byte & 4 != 0,
                     target,
                 });
+                if hit_index == hits.len() {
+                    break;
+                }
             }
         }
     }
