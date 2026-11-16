@@ -208,6 +208,13 @@ proc storeCached(c: CacheClient, url, body, etag, lastModified: string) =
   moveFile(tmpBody, bodyPath)
   moveFile(tmpMeta, metaPath)
 
+proc isZstdString(data: string): bool =
+  data.len > 4 and
+    zstdffi.zstdMagicNumber == (uint32(uint8(data[0])) or
+      uint32(uint8(data[1]) shl 8) or
+      uint32(uint8(data[2]) shl 16) or
+      uint32(uint8(data[3]) shl 24))
+
 proc decodeBody*(raw, encoding, url: string): string =
   ## Undo the HTTP `Content-Encoding` applied to a cache response.
   ##
@@ -222,7 +229,12 @@ proc decodeBody*(raw, encoding, url: string): string =
   ## a new codec.
   case encoding
   of "", "identity":
-    raw
+    if isZstdString(raw):
+      try:
+        decompressStream(raw)
+      except ZstdError as e:
+        raise newException(IOError, "zstd decode failed for " & url & ": " & e.msg)
+    else: raw
   of "zstd":
     try:
       decompressStream(raw)
