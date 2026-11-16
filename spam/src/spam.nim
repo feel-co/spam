@@ -141,6 +141,7 @@
 
 import std/[algorithm, asyncdispatch, hashes, json, os, parseopt, sequtils,
     sets, strformat, strutils, tables]
+from std/posix import setrlimit, RLIMIT_NOFILE, RLimit
 from std/unicode import validateUtf8
 import filemeta
 import cache
@@ -1857,7 +1858,13 @@ proc indexLib(source, prefix, payloadPath: string, summary: var JsonNode) =
   writeLibPayload(payloadPath, records)
   summary = %* {"functions": records.len}
 
+proc raiseOpenFileLimit =
+  var lim = RLimit(rlim_cur: 8192, rlim_max: 8192)
+  discard setrlimit(RLIMIT_NOFILE, lim)
+
 proc runIndex(config: Config) =
+  raiseOpenFileLimit()
+
   let outPath =
     if config.output.len > 0: config.output
     else: config.database
