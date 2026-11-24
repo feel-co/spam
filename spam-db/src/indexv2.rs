@@ -79,66 +79,102 @@ struct Trigram {
     postings_length: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct Header {
+    names: Vec<String>,
+    sets: Vec<Vec<usize>>,
+    groups: Vec<Group>,
+    postings: Vec<u8>,
+    trigrams: HashMap<u32, Trigram>,
+    columns_offset: u64,
+}
+
+impl Header {
+    pub(crate) fn load(db: &DbFile, section: Section) -> Result<Self> {
+        let fixed = db.read_at(section, 0, FIXED_HEADER_SIZE)?;
+        let record_count = read_u64le(&fixed, 0)?;
+        let name_count = read_u32le(&fixed, 8)? as usize;
+        let set_count = read_u32le(&fixed, 12)? as usize;
+        let group_count = read_u32le(&fixed, 16)? as usize;
+        let trigram_count = read_u32le(&fixed, 20)? as usize;
+        let column_count = read_u32le(&fixed, 24)? as usize;
+        let sub_count = read_u32le(&fixed, 28)? as u64;
+
+        if column_count != COLUMN_COUNT {
+            return Err(invalid("unexpected v2 column count"));
+        }
+        if sub_count != 6 {
+            return Err(invalid("unexpected v2 section count"));
+        }
+
+        let table = db.read_at(
+            section,
+            FIXED_HEADER_SIZE,
+            sub_count
+                .checked_mul(SECTION_ENTRY_SIZE)
+                .ok_or_else(|| invalid("section table is too large"))?,
+        )?;
+
+        let mut subs = Vec::with_capacity(sub_count as usize);
+        for i in 0..sub_count as usize {
+            let base = i * SECTION_ENTRY_SIZE as usize;
+            subs.push(SubSection {
+                kind: read_u16le(&table, base)?,
+                offset: read_u64le(&table, base + 4)?,
+                length: read_u64le(&table, base + 12)?,
+            });
+        }
+
+        let columns_sub = find(&subs, SECTION_COLUMNS)?;
+        let names = parse_names(
+            &decompress(&read(db, section, find(&subs, SECTION_PACKAGE_NAMES)?)?)?,
+            name_count,
+        )?;
+        let sets = parse_sets(
+            &decompress(&read(db, section, find(&subs, SECTION_PACKAGE_SETS)?)?)?,
+            set_count,
+            name_count,
+        )?;
+        let groups = parse_directory(
+            &decompress(&read(db, section, find(&subs, SECTION_DIRECTORY)?)?)?,
+            group_count,
+            record_count,
+            columns_sub.length,
+        )?;
+        let postings = decompress(&read(db, section, find(&subs, SECTION_POSTINGS)?)?)?;
+        let trigrams = parse_trigrams(
+            &decompress(&read(db, section, find(&subs, SECTION_TRIGRAMS)?)?)?,
+            trigram_count,
+            postings.len(),
+        )?;
+
+        Ok(Self {
+            names,
+            sets,
+            groups,
+            postings,
+            trigrams,
+            columns_offset: columns_sub.offset,
+        })
+    }
+}
+
 /// Return every record whose path contains `query`.
-pub(crate) fn query(db: &DbFile, section: Section, query: &str) -> Result<Vec<FileRecord>> {
-    let fixed = db.read_at(section, 0, FIXED_HEADER_SIZE)?;
-    let record_count = read_u64le(&fixed, 0)?;
-    let name_count = read_u32le(&fixed, 8)? as usize;
-    let set_count = read_u32le(&fixed, 12)? as usize;
-    let group_count = read_u32le(&fixed, 16)? as usize;
-    let trigram_count = read_u32le(&fixed, 20)? as usize;
-    let column_count = read_u32le(&fixed, 24)? as usize;
-    let sub_count = read_u32le(&fixed, 28)? as u64;
-
-    if column_count != COLUMN_COUNT {
-        return Err(invalid("unexpected v2 column count"));
-    }
-    if sub_count != 6 {
-        return Err(invalid("unexpected v2 section count"));
-    }
-
-    let table = db.read_at(
-        section,
-        FIXED_HEADER_SIZE,
-        sub_count
-            .checked_mul(SECTION_ENTRY_SIZE)
-            .ok_or_else(|| invalid("section table is too large"))?,
-    )?;
-
-    let mut subs = Vec::with_capacity(sub_count as usize);
-    for i in 0..sub_count as usize {
-        let base = i * SECTION_ENTRY_SIZE as usize;
-        subs.push(SubSection {
-            kind: read_u16le(&table, base)?,
-            offset: read_u64le(&table, base + 4)?,
-            length: read_u64le(&table, base + 12)?,
-        });
-    }
-
-    let columns_sub = find(&subs, SECTION_COLUMNS)?;
-    let names = parse_names(
-        &decompress(&read(db, section, find(&subs, SECTION_PACKAGE_NAMES)?)?)?,
-        name_count,
-    )?;
-    let sets = parse_sets(
-        &decompress(&read(db, section, find(&subs, SECTION_PACKAGE_SETS)?)?)?,
-        set_count,
-        name_count,
-    )?;
-    let groups = parse_directory(
-        &decompress(&read(db, section, find(&subs, SECTION_DIRECTORY)?)?)?,
-        group_count,
-        record_count,
-        columns_sub.length,
-    )?;
-    let postings = decompress(&read(db, section, find(&subs, SECTION_POSTINGS)?)?)?;
-    let trigrams = parse_trigrams(
-        &decompress(&read(db, section, find(&subs, SECTION_TRIGRAMS)?)?)?,
-        trigram_count,
-        postings.len(),
-    )?;
-
-    let candidates = candidate_groups(query, &trigrams, &postings, group_count)?;
+pub(crate) fn query(
+    db: &DbFile,
+    section: Section,
+    header: &Header,
+    query: &str,
+) -> Result<Vec<FileRecord>> {
+    let Header {
+        names,
+        sets,
+        groups,
+        postings,
+        trigrams,
+        columns_offset,
+    } = header;
+    let candidates = candidate_groups(query, trigrams, postings, groups.len())?;
 
     let mut records = Vec::new();
     for group_id in candidates {
@@ -149,7 +185,7 @@ pub(crate) fn query(db: &DbFile, section: Section, query: &str) -> Result<Vec<Fi
         let column = |index: usize| -> Result<Vec<u8>> {
             decompress(&db.read_at(
                 section,
-                columns_sub.offset + group.column_offset(index),
+                columns_offset + group.column_offset(index),
                 u64::from(group.lengths[index]),
             )?)
         };
@@ -161,40 +197,38 @@ pub(crate) fn query(db: &DbFile, section: Section, query: &str) -> Result<Vec<Fi
         let suffixes = column(COL_SUFFIX)?;
 
         let rows = group.record_count as usize;
-        let mut paths: Vec<String> = Vec::with_capacity(rows);
-        let mut hits: Vec<usize> = Vec::new();
+        let suffixes = std::str::from_utf8(&suffixes)
+            .map_err(|_| invalid("non-UTF-8 path suffix"))?;
+        let mut hits: Vec<(usize, String)> = Vec::new();
         let mut diff_pos = 0usize;
         let mut len_pos = 0usize;
         let mut suffix_pos = 0usize;
         let mut shared: i64 = 0;
-        let mut previous = String::new();
+        let mut current = String::new();
 
         for row in 0..rows {
             shared += read_diff(&diffs, &mut diff_pos)?;
-            if shared < 0 || shared as usize > previous.len() {
+            if shared < 0 || shared as usize > current.len() {
                 return Err(invalid("invalid v2 path prefix boundary"));
             }
             let shared_len = shared as usize;
-            if !previous.is_char_boundary(shared_len) {
+            if !current.is_char_boundary(shared_len) {
                 return Err(invalid("invalid v2 path prefix boundary"));
             }
             let suffix_len = read_varint(&suffix_lens, &mut len_pos)? as usize;
             let end = suffix_pos
                 .checked_add(suffix_len)
                 .ok_or_else(|| invalid("v2 suffix slice overflow"))?;
-            if end > suffixes.len() {
-                return Err(invalid("truncated v2 path suffix"));
-            }
-            let suffix = std::str::from_utf8(&suffixes[suffix_pos..end])
-                .map_err(|_| invalid("non-UTF-8 path suffix"))?;
+            let suffix = suffixes
+                .get(suffix_pos..end)
+                .ok_or_else(|| invalid("truncated or non-UTF-8 v2 path suffix"))?;
             suffix_pos = end;
 
-            let path = format!("{}{}", &previous[..shared_len], suffix);
-            if path.contains(query) {
-                hits.push(row);
+            current.truncate(shared_len);
+            current.push_str(suffix);
+            if current.contains(query) {
+                hits.push((row, current.clone()));
             }
-            previous = path.clone();
-            paths.push(path);
         }
 
         if hits.is_empty() {
@@ -255,20 +289,24 @@ pub(crate) fn query(db: &DbFile, section: Section, query: &str) -> Result<Vec<Fi
                 target_pos = end;
             }
 
-            if hit_index < hits.len() && hits[hit_index] == row {
+            if hit_index < hits.len() && hits[hit_index].0 == row {
+                let path = std::mem::take(&mut hits[hit_index].1);
                 hit_index += 1;
                 let ids = sets
                     .get(set_id)
                     .ok_or_else(|| invalid("invalid v2 package set id"))?;
                 let packages = ids.iter().map(|id| names[*id].clone()).collect();
                 records.push(FileRecord {
-                    path: std::mem::take(&mut paths[row]),
+                    path,
                     packages,
                     size,
                     kind,
                     executable: flag_byte & 4 != 0,
                     target,
                 });
+                if hit_index == hits.len() {
+                    break;
+                }
             }
         }
     }

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::OnceLock};
 
 use crate::{
     Error, Result, indexv1, indexv2,
@@ -42,6 +42,7 @@ pub struct FileRecord {
 pub struct PackagesDb {
     db: DbFile,
     section: Section,
+    v2: OnceLock<indexv2::Header>,
 }
 
 impl PackagesDb {
@@ -53,7 +54,11 @@ impl PackagesDb {
         let section = db
             .section(Scope::Pkg)
             .ok_or_else(|| Error::InvalidDatabase("database has no pkg section".into()))?;
-        Ok(Self { db, section })
+        Ok(Self {
+            db,
+            section,
+            v2: OnceLock::new(),
+        })
     }
 
     /// Return all records whose path contains `query` as a substring.
@@ -61,7 +66,16 @@ impl PackagesDb {
         match self.section.encoding {
             SectionEncoding::Buckets => self.query_bucketed(query),
             SectionEncoding::IndexV1 => indexv1::query(&self.db, self.section, query),
-            SectionEncoding::IndexV2 => indexv2::query(&self.db, self.section, query),
+            SectionEncoding::IndexV2 => {
+                let header = match self.v2.get() {
+                    Some(header) => header,
+                    None => {
+                        let header = indexv2::Header::load(&self.db, self.section)?;
+                        self.v2.get_or_init(|| header)
+                    }
+                };
+                indexv2::query(&self.db, self.section, header, query)
+            }
         }
     }
 
